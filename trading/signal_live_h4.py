@@ -661,6 +661,212 @@ def live_state(mod, df) -> dict:
                 newest_i=newest_i, filled_this_bar=False)
 
 
+def track_orders(mod, df) -> dict:
+    """
+    Walk the bars once and report EVERY order the plan has produced, with its
+    current state - not just the one that is still live.
+
+    The distinct states a trader must act on differently:
+      baru        signal just fired, nothing filled and nothing placed yet
+      terisi      entry touched, position is running -> leave it alone
+      menunggu    stop not touched yet -> keep it, count the hours left
+      batal       window closed unfilled -> DELETE the pending order
+      TP / SL     finished -> delete the order, take the result
+    """
+    import pandas as pd
+
+    lv = sorted(set(mod.RED_LEVELS))
+    buf, cap, rr, ttl = mod.BUFFER_USD, mod.CAP_USD, mod.SL_RR_RATIO, mod.TTL_BARS
+    d = df[df["ts"] >= pd.Timestamp(mod.START_DEFAULT)].reset_index(drop=True)
+
+    rows: list[dict] = []
+    pos = pending = prev_close = None
+    last_exit_i = -10 ** 9
+
+    for i in range(len(d)):
+        r = d.iloc[i]
+        hi, lo, cl, ts = r["h"], r["l"], r["c"], r["ts"]
+
+        if pos is not None:
+            if pos["type"] == "Buy":
+                sl_hit, tp_hit = lo <= pos["sl"], hi >= pos["tp"]
+            else:
+                sl_hit, tp_hit = hi >= pos["sl"], lo <= pos["tp"]
+            hit = ("SL" if (sl_hit and tp_hit)
+                   else ("TP" if tp_hit else ("SL" if sl_hit else None)))
+            if hit:
+                pos["state"] = hit
+                pos["exit_ts"] = ts
+                pos["exit_i"] = i
+                rows.append(pos)
+                pos, last_exit_i = None, i
+
+        if pos is None and pending is not None:
+            if i - pending["bar"] > ttl:
+                pending["state"] = "batal"
+                pending["exit_i"] = i
+                rows.append(pending)
+                pending = None
+            else:
+                filled = (hi >= pending["entry"] if pending["type"] == "Buy"
+                          else lo <= pending["entry"])
+                if filled:
+                    pos = dict(pending)
+                    pos.update(ts=ts, bars=0, fill_i=i)
+                    pending = None
+
+        if pos is not None:
+            pos["bars"] = pos.get("bars", 0) + 1
+
+        if pos is None and pending is None and prev_close is not None \
+                and (i - last_exit_i > 0):
+            up = next((L for L in lv if prev_close <= L < cl), None)
+            dn = next((L for L in lv if prev_close >= L > cl), None)
+            if up is not None:
+                entry = up + buf
+                above = [x for x in lv if x > entry]
+                if above:
+                    tgt = min(above)
+                    dist = min(tgt - entry, cap)
+                    if dist > 1.0:
+                        pending = dict(bar=i, sig_ts=ts, type="Buy", entry=entry,
+                                       tp=entry + dist, sl=entry - dist * rr,
+                                       level=up, tp_level=tgt, state="menunggu")
+            elif dn is not None:
+                entry = dn - buf
+                below = [x for x in lv if x < entry]
+                if below:
+                    tgt = max(below)
+                    dist = min(entry - tgt, cap)
+                    if dist > 1.0:
+                        pending = dict(bar=i, sig_ts=ts, type="Sell", entry=entry,
+                                       tp=entry - dist, sl=entry + dist * rr,
+                                       level=dn, tp_level=tgt, state="menunggu")
+
+        prev_close = cl
+
+    newest_i = len(d) - 1
+    if pos is not None:
+        pos["state"] = "terisi"
+        rows.append(pos)
+    if pending is not None:
+        pending["state"] = "menunggu"
+        rows.append(pending)
+    return dict(rows=rows, newest_i=newest_i, ttl=ttl, last_bar=d.iloc[-1])
+
+
+def build_positions_report() -> str:
+    """
+    /posisi - what is running, what must be deleted, and whether anything new
+    has fired. This answers the question the trader actually asks after a fill:
+    'is this still my trade, or do I take it off?'
+    """
+    import pandas as pd
+
+    mod = load_locked()
+    hst = freshest_hst()
+    bars = read_hst(hst)
+    df = bars_to_frame(bars)
+    tr = track_orders(mod, df)
+    rows, ttl = tr["rows"], tr["ttl"]
+    newest_ts = pd.Timestamp(df.ts.iloc[-1])
+    newest_close = float(df.c.iloc[-1])
+    real_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    data_age_h = max(0.0, (real_now - newest_ts.to_pydatetime()).total_seconds() / 3600)
+
+    live = [r for r in rows if r["state"] in ("terisi", "menunggu")]
+    done = [r for r in rows if r["state"] in ("TP", "SL", "batal")]
+
+    L = []
+    L.append(f"<b>POSISI &amp; ORDER XAUUSD</b> · "
+             f"{datetime.now().strftime('%d-%b %H:%M')} WIB")
+    L.append(f"Harga {newest_close:.2f} · data {fmt_age(data_age_h)} lalu")
+    L.append("")
+
+    # When the data is old, every 'action' below is a guess about a market we
+    # are not seeing. Say so first and loudly, before any price is trusted.
+    if data_age_h > 6:
+        L.append("🔴 <b>DATA MATI — jangan ambil keputusan dari laporan ini.</b>")
+        L.append(f"   Lilin terakhir {newest_ts:%d-%b %H:%M}, "
+                 f"seharusnya paling lama 4 jam lalu.")
+        L.append("   Buka MT4, cek jam &amp; ikon koneksi, lalu ketik /posisi lagi.")
+        L.append("")
+
+    # --- what is on right now -------------------------------------------
+    L.append("<b>Yang sedang berjalan</b>")
+    if not live:
+        L.append("  Tidak ada. Tidak ada order yang perlu dijaga.")
+        if data_age_h <= 6:
+            L.append("  → Kalau Anda punya order nyata di MT4, "
+                     "<b>hapus</b> — metode tidak mengakui order itu.")
+    for r in sorted(live, key=lambda x: x.get("sig_ts", pd.Timestamp.min)):
+        act = "BUY" if r["type"] == "Buy" else "SELL"
+        if r["state"] == "terisi":
+            L.append("")
+            L.append(f"🟢 <b>{act} — SUDAH TERISI / POSISI BERJALAN</b>")
+            L.append(f"Entry <code>{r['entry']:.2f}</code>")
+            L.append(f"SL <code>{r['sl']:.2f}</code>   TP <code>{r['tp']:.2f}</code>")
+            L.append(f"Terisi {pd.Timestamp(r['ts']):%d-%b %H:%M} · "
+                     f"sudah {r.get('bars', 0)} lilin H4")
+            L.append("→ <b>Aksi: biarkan. Jangan diubah, jangan ditambah.</b>")
+        else:
+            # Count real elapsed time, not bars x 4: H4 bars skip the weekend
+            # gap, so a bar count badly understates how long is left.
+            deadline = pd.Timestamp(r["sig_ts"]) + pd.Timedelta(hours=ttl * 4)
+            sisa = max(0.0, (deadline - newest_ts.to_pydatetime()).total_seconds() / 3600)
+            L.append("")
+            L.append(f"🟡 <b>{act} — BELUM TERISI</b>")
+            L.append(f"Entry <code>{r['entry']:.2f}</code>")
+            L.append(f"SL <code>{r['sl']:.2f}</code>   TP <code>{r['tp']:.2f}</code>")
+            L.append(f"Sinyal {pd.Timestamp(r['sig_ts']):%d-%b %H:%M} · "
+                     f"sisa <b>{sisa:.0f} jam</b> sebelum hangus")
+            L.append("→ <b>Aksi: biarkan menunggu.</b> Batalkan hanya bila "
+                     f"sisa {sisa:.0f} jam habis tanpa terisi.")
+    L.append("")
+
+    # --- what changed on the newest bar ----------------------------------
+    L.append("<b>Terjadi apa di lilin terakhir</b>")
+    changed = [r for r in rows
+               if r["state"] in ("TP", "SL", "batal")
+               and r.get("exit_i") == tr["newest_i"]]
+    if not changed:
+        L.append("  Tidak ada perubahan. Semua seperti lilin sebelumnya.")
+    for r in changed:
+        act = "BUY" if r["type"] == "Buy" else "SELL"
+        if r["state"] == "batal":
+            L.append(f"  ❌ {act} {r['entry']:.2f} <b>HANGUS</b> — tidak terisi "
+                     f"dalam {ttl} lilin. <b>Hapus ordernya.</b>")
+        else:
+            mark = "✅" if r["state"] == "TP" else "🛑"
+            L.append(f"  {mark} {act} {r['entry']:.2f} kena <b>{r['state']}</b>. "
+                     f"<b>Hapus ordernya.</b>")
+    L.append("")
+
+    # --- anything new on this bar? ---------------------------------------
+    fresh = [r for r in rows if r.get("bar") == tr["newest_i"]]
+    L.append("<b>Sinyal baru di lilin ini</b>")
+    if not fresh:
+        L.append("  Tidak ada. Metode belum memberi sinyal baru.")
+        L.append("  <i>Tidak perlu dipaksa — menunggu bukan kesalahan.</i>")
+    for r in fresh:
+        act = "BUY" if r["type"] == "Buy" else "SELL"
+        L.append(f"  🆕 {act} entry {r['entry']:.2f} "
+                 f"SL {r['sl']:.2f} TP {r['tp']:.2f}")
+    L.append("")
+
+    if done:
+        L.append("➖➖➖ <i>riwayat terakhir</i> ➖➖➖")
+        for r in done[-5:]:
+            act = "BUY" if r["type"] == "Buy" else "SELL"
+            L.append(f"  {act} {r['entry']:.2f} → <b>{r['state']}</b> "
+                     f"({pd.Timestamp(r.get('exit_ts', r['sig_ts'])):%d-%b %H:%M})")
+        L.append("")
+
+    L.append(f"<i>Metode: {mod.METHOD_ID} v{mod.METHOD_VERSION} · "
+             f"aturan: stop order, TTL {ttl} lilin H4</i>")
+    return "\n".join(L)
+
+
 def build_status_report() -> str:
     """
     Everything a trader wants at a glance: where price is, whether there is a
@@ -983,16 +1189,20 @@ def cmd_poll() -> int:
         # from a broken schedule.
         if cmd in ("/mulai", "/start", "/help", "/bantuan"):
             reply = ("<b>Robot XAUUSD H4 aktif.</b>\n\n"
+                     "<b>/posisi</b> — order mana yang jalan, mana yang harus dihapus\n"
                      "<b>/status</b> — apa yang harus saya pasang sekarang\n"
                      "<b>/plan</b> — skenario lengkap: entry, TP, SL, risiko\n\n"
                      "Sinyal baru saya kirim otomatis begitu lilin H4 tutup.\n"
-                     "<i>Ketik /status kapan saja, tidak perlu menunggu.</i>")
+                     "<i>Ketik perintah kapan saja, tidak perlu menunggu.</i>")
+        elif cmd in ("/posisi", "/pos", "/position", "/order", "/running"):
+            reply = build_positions_report()
         elif cmd in ("/plan", "/rencana"):
             reply = build_plan_report()
         elif cmd in ("/status", "/harga", "/price", "/signal"):
             reply = build_status_report()
         else:
             reply = ("Perintah itu belum ada.\n\n"
+                     "<b>/posisi</b> — order jalan / harus dihapus\n"
                      "<b>/status</b> — apa yang harus dipasang sekarang\n"
                      "<b>/plan</b> — skenario entry, TP, SL, risiko")
         # /status answers are priority 3: they must never look like a signal.
