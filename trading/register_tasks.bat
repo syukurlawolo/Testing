@@ -1,8 +1,12 @@
 @echo off
 REM ==========================================================================
 REM  Daftarkan ulang kedua task penjadwal XAUUSD H4.
-REM  Jalankan ini setelah install Hermes baru / setelah folder trading dipulihkan.
-REM  Klik dua kali, atau jalankan dari Command Prompt.
+REM
+REM  PENTING: skrip ini memakai XML, BUKAN "schtasks /SC". Alasannya:
+REM  /SC DAILY membuat trigger dengan <Duration>P1D</Duration>, artinya
+REM  jadwal HANYA BERLAKU 1 HARI lalu berhenti sendiri TANPA pesan error.
+REM  Itu penyebab robot pernah diam total. XML di bawah tidak punya
+REM  <Duration>, jadi berulang tanpa batas.
 REM ==========================================================================
 
 set DIR=C:\Users\Sharing Vision\AppData\Local\hermes\trading
@@ -13,24 +17,20 @@ echo   MEMASANG JADWAL ROBOT XAUUSD H4
 echo ============================================================
 echo.
 
-REM --- Hapus kalau sudah ada, supaya tidak dobel ---
+REM --- Hapus dulu supaya tidak dobel ---
 schtasks /Delete /TN "XAUUSD_Locked_H4_Signal" /F >nul 2>&1
 schtasks /Delete /TN "XAUUSD_Telegram_Status" /F >nul 2>&1
 
 REM --- Task 1: kirim sinyal tiap lilin H4 tutup (5 menit setelahnya) ---
-schtasks /Create /TN "XAUUSD_Locked_H4_Signal" ^
- /TR "\"%DIR%\run_signal.bat\"" ^
- /SC DAILY /ST 07:05 /RI 240 /DU 24:00 /F >nul
+schtasks /Create /TN "XAUUSD_Locked_H4_Signal" /XML "%DIR%\signal_task.xml" /F >nul
 if errorlevel 1 (
     echo   GAGAL membuat XAUUSD_Locked_H4_Signal
 ) else (
-    echo   OK  XAUUSD_Locked_H4_Signal   ^(07:05 11:05 15:05 19:05 23:05 03:05^)
+    echo   OK  XAUUSD_Locked_H4_Signal   ^(tiap 4 jam, mulai 07:05^)
 )
 
-REM --- Task 2: balas /status tiap 5 menit ---
-schtasks /Create /TN "XAUUSD_Telegram_Status" ^
- /TR "\"%DIR%\poll_only.bat\"" ^
- /SC MINUTE /MO 5 /F >nul
+REM --- Task 2: balas /status dan /plan tiap 5 menit ---
+schtasks /Create /TN "XAUUSD_Telegram_Status" /XML "%DIR%\poll_task.xml" /F >nul
 if errorlevel 1 (
     echo   GAGAL membuat XAUUSD_Telegram_Status
 ) else (
@@ -39,17 +39,11 @@ if errorlevel 1 (
 
 echo.
 echo ------------------------------------------------------------
-echo   PENTING: matikan syarat "hanya saat listrik" untuk kedua task,
-echo   kalau tidak laptop yang pakai baterai akan diam saja.
+echo   KALAU "Next Run Time" KOSONG
 echo ------------------------------------------------------------
-for %%T in ("XAUUSD_Locked_H4_Signal" "XAUUSD_Telegram_Status") do (
-    powershell -NoProfile -Command ^
-      "$s=Get-ScheduledTask -TaskName %%T -ErrorAction SilentlyContinue; if($s){$s.Settings.DisallowStartIfOnBatteries=$false; $s.Settings.StopIfGoingOnBatteries=$false; Set-ScheduledTask -TaskName %%T -Settings $s.Settings | Out-Null; Write-Host '  OK  baterai diizinkan untuk' %%T }" 2>nul
-)
-
-echo.
-echo ------------------------------------------------------------
-echo   JADWAL SEKARANG
+echo   StartBoundary di XML sudah lewat tanggalnya. Buka
+echo   signal_task.xml / poll_task.xml, ubah ke HARI INI dengan
+echo   jam yang belum lewat, lalu jalankan skrip ini lagi.
 echo ------------------------------------------------------------
 for %%T in ("XAUUSD_Locked_H4_Signal" "XAUUSD_Telegram_Status") do (
     echo.

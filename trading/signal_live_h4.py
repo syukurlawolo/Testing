@@ -269,7 +269,16 @@ def sig_key(t: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def tg_send(token: str, chat_id: str, text: str, dry: bool = False) -> bool:
+def tg_send(token: str, chat_id: str, text: str, dry: bool = False,
+            loud: bool = False) -> bool:
+    """
+    Send a Telegram message.
+
+    loud=True is for SIGNALS ONLY. It asks Telegram for an audible
+    notification and keeps the message high in the chat, so a new signal cannot
+    be mistaken for a routine /status reply. /status itself stays silent on
+    purpose: a bot that pings you every five minutes trains you to ignore it.
+    """
     if dry:
         print("\n--- DRY RUN (not sent) ---\n" + text + "\n--------------------------")
         return True
@@ -278,10 +287,14 @@ def tg_send(token: str, chat_id: str, text: str, dry: bool = False) -> bool:
         print(text)
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
+    payload = {
         "chat_id": chat_id, "text": text,
         "parse_mode": "HTML", "disable_web_page_preview": "true",
-    }).encode()
+    }
+    if loud:
+        payload["disable_notification"] = "false"   # force the alert through
+        payload["protect_content"] = "false"
+    data = urllib.parse.urlencode(payload).encode()
     for attempt in range(3):
         try:
             with urllib.request.urlopen(url, data=data, timeout=20) as r:
@@ -307,8 +320,31 @@ def fmt_signal(t: dict, now_bar) -> str:
     arrow = "🟢 BUY" if act == "Buy" else "🔴 SELL"
     dist = abs(t["tp"] - t["entry"])
 
+    # A live signal (fired, not yet exited) is the one that actually matters:
+    # it is an order waiting to be placed. Say so loudly.
+    if t.get("_live"):
+        kind = t.get("_kind")
+        if kind == "open":
+            head = f"<b>{arrow} XAUUSD — POSISI TERBUKA</b>"
+            tail = [
+                f"<i>Limit sudah terisi. TP/SL sedang berjalan.</i>",
+                f"<i>Jangan buka posisi baru sampai yang ini ditutup.</i>",
+            ]
+        else:
+            head = f"<b>{arrow} SINYAL BARU XAUUSD</b>"
+            tail = [
+                f"<b>→ Pasang {act.upper()} LIMIT di {t['entry']:.2f}</b>",
+                f"<i>Batalkan kalau belum terisi dalam 8 jam (2 lilin H4).</i>",
+            ]
+    else:
+        head = f"<b>{arrow} XAUUSD</b>  ·  H4 · locked cap-$30"
+        tail = [
+            f"<i>Set a {act.upper()} LIMIT at {t['entry']:.2f}.</i>",
+            f"<i>The order is cancelled if price does not retrace within 8h.</i>",
+        ]
+
     lines = [
-        f"<b>{arrow} XAUUSD</b>  ·  H4 · locked cap-$30",
+        head,
         "",
         f"<b>Entry</b>  {t['entry']:.2f}   (limit)",
         f"<b>TP</b>       {t['tp']:.2f}   (+{dist:.2f})",
@@ -319,8 +355,7 @@ def fmt_signal(t: dict, now_bar) -> str:
         f"Signal bar   : {d:%d-%b-%Y %H:%M}",
         f"Valid for    : 2 H4 bars (8 hours)",
         "",
-        f"<i>Set a {act.upper()} LIMIT at {t['entry']:.2f}.</i>",
-        f"<i>The order is cancelled if price does not retrace within 8h.</i>",
+        *tail,
     ]
     return "\n".join(lines)
 
@@ -390,8 +425,40 @@ def scan(mod, bars: list[dict], full: bool = False) -> dict:
         new = fresh
 
     # Current position = a trade whose exit came from the newest bars.
-    open_pos = None
     last_t = trades.iloc[-1].to_dict()
+
+    # ------------------------------------------------------------------
+    # A signal that has fired but has NOT been filled yet does not exist in
+    # run()'s output at all - run() only returns FINISHED trades. That is
+    # exactly the signal a trader needs, so build it here from live_state(),
+    # which walks the same bars with the same locked parameters.
+    # ------------------------------------------------------------------
+    if not full:
+        ls = live_state(mod, df)
+        if ls["kind"] in ("pending", "open"):
+            i = ls["info"]
+            k = (f"{i['type']}|{i['entry']:.2f}|"
+                 f"{pd.Timestamp(i['sig_ts']):%Y-%m-%d %H:%M}")
+            already = k in seen or k == last_key
+            if not already and pd.Timestamp(i["sig_ts"]) >= cutoff:
+                live_sig = {
+                    "action": i["type"],
+                    "entry": i["entry"], "tp": i["tp"], "sl": i["sl"],
+                    "level": i["level"], "tp_level": i["tp_level"],
+                    "entry_time": pd.Timestamp(i["sig_ts"]),
+                    "exit_time": None,
+                    "result": "OPEN" if ls["kind"] == "open" else "PENDING",
+                    "pl_usd": 0.0, "pl_pips": 0.0, "bars": ls["bars_used"],
+                    "_live": True, "_kind": ls["kind"],
+                }
+                # Do not duplicate: run() may already list this one as a
+                # finished trade only after it exits, so at this point it is
+                # guaranteed absent.
+                new.append(live_sig)
+            elif already:
+                print(f"  live signal already announced ({i['type']} "
+                      f"{i['entry']:.2f})")
+
     return dict(bars=len(df), last_bar=str(df.ts.iloc[-1]), trades=len(trades),
                 new=new, position=last_t, state=st)
 
@@ -621,6 +688,177 @@ def build_status_report() -> str:
     return "\n".join(L)
 
 
+def plan_scenarios(newest_close: float, mod, ls: dict) -> list:
+    """
+    The concrete breakout scenarios the method is waiting for, worked out with
+    the LOCKED parameters. Nothing here re-invents a number: buffer, cap, RR and
+    TTL all come off the locked module, exactly like live_state() does.
+    """
+    lv = sorted(set(mod.RED_LEVELS))
+    buf, cap, rr = mod.BUFFER_USD, mod.CAP_USD, mod.SL_RR_RATIO
+
+    out = []
+
+    up = next_level_up(newest_close, lv)
+    if up is not None:
+        entry = up + buf
+        above = [x for x in lv if x > entry]
+        if above:
+            tgt = min(above)
+            dist = min(tgt - entry, cap)
+            if dist > 1.0:
+                out.append(dict(
+                    side="BUY", level=up, entry=entry, tp=entry + dist,
+                    sl=entry - dist * rr, dist=dist, tp_level=tgt,
+                    capped=(tgt - entry) > cap,
+                ))
+
+    dn = next_level_down(newest_close, lv)
+    if dn is not None:
+        entry = dn - buf
+        below = [x for x in lv if x < entry]
+        if below:
+            tgt = max(below)
+            dist = min(entry - tgt, cap)
+            if dist > 1.0:
+                out.append(dict(
+                    side="SELL", level=dn, entry=entry, tp=entry - dist,
+                    sl=entry + dist * rr, dist=dist, tp_level=tgt,
+                    capped=(entry - tgt) > cap,
+                ))
+
+    return out
+
+
+def build_plan_report() -> str:
+    """
+    /plan - a full trading plan, not just a status line.
+
+    /status says 'what is happening'. /plan says 'what I will do, at what price,
+    with what risk, and what would cancel it'. Every number is derived from the
+    locked module, so the plan can never drift from the method.
+    """
+    import pandas as pd
+
+    mod = load_locked()
+    hst = freshest_hst()
+    bars = read_hst(hst)
+    df = bars_to_frame(bars)
+
+    newest_ts = pd.Timestamp(df.ts.iloc[-1])
+    newest_close = float(df.c.iloc[-1])
+    real_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    data_age_h = max((real_now - newest_ts.to_pydatetime()).total_seconds() / 3600, 0.0)
+
+    ls = live_state(mod, df)
+    ttl = ls["ttl"]
+    buf, cap, rr = mod.BUFFER_USD, mod.CAP_USD, mod.SL_RR_RATIO
+
+    L = []
+    L.append("<b>🗺️ RENCANA TRADING XAUUSD · H4</b>")
+    L.append(f"<i>{datetime.now().strftime('%d-%b-%Y %H:%M')} WIB</i>")
+    L.append("")
+
+    # --- 1. where we stand ------------------------------------------------
+    L.append("<b>1. POSISI SEKARANG</b>")
+    L.append(f"  Harga : <b>{newest_close:.2f}</b>  "
+             f"<i>(close H4 {newest_ts:%d-%b %H:%M})</i>")
+    L.append(f"  Data  : {fmt_age(data_age_h)} lalu")
+    if data_age_h > 6:
+        L.append("  ⚠️ <b>Data basi.</b> MT4 tertutup/belum login —")
+        L.append("     rencana di bawah belum bisa dieksekusi.")
+    L.append("")
+
+    # --- 2. is there already something on? --------------------------------
+    L.append("<b>2. YANG SUDAH BERJALAN</b>")
+    if ls["kind"] == "open":
+        i = ls["info"]
+        arrow = "🟢 BUY" if i["type"] == "Buy" else "🔴 SELL"
+        sisa = max(0, (ttl - ls["bars_used"]) * 4)
+        L.append(f"  {arrow} <b>posisi terbuka</b> @ {i['entry']:.2f}")
+        L.append(f"  TP {i['tp']:.2f}   SL {i['sl']:.2f}")
+        L.append(f"  Sudah {ls['bars_used']} lilin ({ls['bars_used'] * 4} jam).")
+        risk = abs(i["entry"] - i["sl"])
+        reward = abs(i["tp"] - i["entry"])
+        L.append(f"  Risiko {risk:.2f}  ·  Imbalan {reward:.2f}  ·  "
+                 f"R:R 1:{reward / risk:.2f}" if risk else "")
+        L.append("")
+        L.append("  <b>Rencana:</b> jangan buka posisi baru. Metode ini hanya")
+        L.append("  memegang satu posisi. Tunggu TP atau SL kena.")
+    elif ls["kind"] == "pending":
+        i = ls["info"]
+        arrow = "🟢 BUY" if i["type"] == "Buy" else "🔴 SELL"
+        sisa = max(0, (ttl - ls["bars_used"]) * 4)
+        sisa_bar = max(0, ttl - ls["bars_used"])
+        L.append(f"  {arrow} <b>limit menunggu terisi</b> @ {i['entry']:.2f}")
+        L.append(f"  TP {i['tp']:.2f}   SL {i['sl']:.2f}")
+        L.append(f"  Sisa waktu: <b>{sisa} jam</b> ({sisa_bar} lilin H4 lagi)")
+        L.append("")
+        L.append("  <b>Rencana:</b>")
+        L.append(f"  1. Pasang {i['type'].upper()} LIMIT di <b>{i['entry']:.2f}</b>")
+        L.append(f"  2. Begitu terisi, pasang TP {i['tp']:.2f} & SL {i['sl']:.2f}")
+        L.append(f"  3. Kalau belum terisi sampai {sisa} jam lagi, batalkan.")
+        L.append("     Limit hangus = tidak ada trade. Itu normal, bukan kerugian.")
+    else:
+        L.append("  Tidak ada posisi, tidak ada limit aktif.")
+        L.append("  <b>Rencana:</b> tunggu salah satu skenario di poin 3.")
+    L.append("")
+
+    # --- 3. the scenarios -------------------------------------------------
+    L.append("<b>3. SKENARIO YANG DINANTIKAN</b>")
+    scen = plan_scenarios(newest_close, mod, ls)
+
+    if ls["kind"] == "open":
+        # Showing entries here would contradict point 2. While a position is
+        # running the method takes no new trade, full stop.
+        L.append("  <b>Tidak berlaku sekarang</b> — masih ada posisi terbuka.")
+        L.append("  Metode ini hanya memegang satu posisi. Skenario di bawah")
+        L.append("  baru aktif setelah posisi sekarang ditutup (TP/SL).")
+        L.append("")
+    elif ls["kind"] == "pending":
+        L.append("  <b>Tidak berlaku sampai limit sekarang selesai</b>")
+        L.append("  (terisi, hangus, atau dibatalkan).")
+        L.append("")
+
+    if not scen:
+        L.append("  Tidak ada level valid di arah mana pun.")
+    for n, s in enumerate(scen, 1):
+        jarak_level = abs(s["level"] - newest_close)
+        L.append("")
+        L.append(f"  <b>{n}. {s['side']}</b>")
+        L.append(f"     Syarat : 1 lilin H4 <b>tutup</b> di "
+                 f"{'atas' if s['side'] == 'BUY' else 'bawah'} "
+                 f"<b>{s['level']:.2f}</b>")
+        L.append(f"     Jarak dari harga sekarang: {jarak_level:.2f} poin")
+        L.append(f"     Entry  : <b>{s['entry']:.2f}</b> "
+                 f"<i>(limit {buf:.2f} di belakang level)</i>")
+        L.append(f"     TP     : <b>{s['tp']:.2f}</b> "
+                 f"<i>({s['dist']:.2f}"
+                 f"{' — dipotong dari ' + format(s['tp_level'], '.2f') if s['capped'] else ''})</i>")
+        L.append(f"     SL     : <b>{s['sl']:.2f}</b> "
+                 f"<i>({rr * 100:.0f}% dari jarak TP)</i>")
+        L.append(f"     Hasil  : menang <b>+{s['dist']:.2f}</b> · "
+                 f"kalah <b>−{s['dist'] * rr:.2f}</b> USD per 1.00 lot")
+        L.append(f"     Batas  : limit hangus dalam {ttl * 4} jam kalau tidak tersentuh")
+
+    # --- 4. what cancels the plan ----------------------------------------
+    L.append("")
+    L.append("<b>4. YANG MEMBATALKAN RENCANA</b>")
+    L.append(f"  • Lilin H4 tutup tapi <b>tidak</b> melewati level mana pun")
+    L.append("  • Limit tidak tersentuh dalam batas waktu di atas")
+    L.append("  • Masih ada posisi terbuka (metode ini 1 posisi saja)")
+    L.append("  • Bar exit terakhir belum lewat 1 lilin (cooldown)")
+    L.append("")
+    L.append("<i>Semua angka di atas dihitung oleh metode terkunci — bukan "
+             "perkiraan saya.</i>")
+
+    st = load_state()
+    L.append("")
+    L.append(f"<i>{mod.METHOD_ID} v{mod.METHOD_VERSION} · "
+             f"{len(st.get('sent', []))} sinyal terkirim</i>")
+    return "\n".join(L)
+
+
 def tg_get_updates(token: str, offset: int | None = None) -> list[dict]:
     """
     Fetch pending messages.
@@ -668,13 +906,17 @@ def cmd_poll() -> int:
         if not text.startswith("/"):
             continue
         cmd = text.split()[0].split("@")[0]
-        if cmd not in ("/status", "/harga", "/price", "/signal", "/mulai", "/start"):
+        if cmd not in ("/status", "/harga", "/price", "/signal", "/plan",
+                       "/rencana", "/mulai", "/start"):
             continue
         print(f"  {cmd} from {cid}")
         if cmd in ("/mulai", "/start"):
             reply = ("<b>Robot XAUUSD H4 aktif.</b>\n\n"
-                     "Ketik /status untuk lihat harga & apakah ada sinyal.\n"
+                     "/status — harga sekarang & apakah ada sinyal\n"
+                     "/plan — rencana trading lengkap: entry, TP, SL, risiko\n\n"
                      "Sinyal baru dikirim otomatis saat lilin H4 tutup.")
+        elif cmd in ("/plan", "/rencana"):
+            reply = build_plan_report()
         else:
             reply = build_status_report()
         tg_send(token, cid or chat_id, reply)
@@ -828,8 +1070,9 @@ def _run(dry: bool = False) -> int:
     sent_ok = 0
     for t in r["new"]:
         msg = fmt_signal(t, r["last_bar"])
+        # loud=True: a signal must make a sound. Routine replies must not.
         ok = tg_send(cfg["token"] if cfg else "", cfg["chat_id"] if cfg else "",
-                     msg, dry=dry)
+                     msg, dry=dry, loud=True)
         print(f"  {'SENT' if ok else 'FAILED'}: {t['action']} "
               f"{t['entry']:.2f} TP {t['tp']:.2f} SL {t['sl']:.2f}")
         if ok and not dry:
