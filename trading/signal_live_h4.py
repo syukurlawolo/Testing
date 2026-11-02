@@ -619,65 +619,64 @@ def build_status_report() -> str:
     dn = next_level_down(newest_close, mod.RED_LEVELS)
 
     L = []
-    L.append(f"<b>📊 STATUS XAUUSD · H4</b>")
-    L.append(f"<i>{datetime.now().strftime('%d-%b-%Y %H:%M')} WIB</i>")
+    L.append(f"<b>STATUS XAUUSD</b> · {datetime.now().strftime('%d-%b %H:%M')} WIB")
     L.append("")
-    L.append(f"<b>Harga sekarang</b>")
-    L.append(f"  {newest_close:.2f}   <i>(close H4 terakhir)</i>")
-    L.append(f"  Lilin H4 terakhir : {newest_ts:%d-%b %H:%M}")
-    L.append(f"  Umur data         : {fmt_age(data_age_h)} lalu")
+
+    # --- layar 1: jawabannya saja, tanpa bahasa teknis -------------------
     if data_age_h > 6:
-        L.append("  ⚠️ <b>MT4 tidak memperbarui data.</b>")
-        L.append("     Buka MT4 & login agar sinyal baru masuk.")
-    L.append("")
-    L.append("<b>Level terdekat</b>")
-    if up is not None:
-        L.append(f"  Resistance di atas : {up:.2f}  (+{up - newest_close:.2f})")
-    if dn is not None:
-        L.append(f"  Support di bawah   : {dn:.2f}  ({dn - newest_close:+.2f})")
-    L.append("")
-
-    # --- the live signal block -------------------------------------------
-    L.append("<b>Sinyal aktif</b>")
-    if ls["kind"] in ("pending", "open"):
+        L.append("🔴 <b>DATA MATI — jangan trading.</b>")
+        L.append("MT4 tidak memperbarui harga. Buka MT4, login, tunggu.")
+        L.append(f"<i>Harga terakhir {newest_close:.2f} dari "
+                 f"{fmt_age(data_age_h)} lalu.</i>")
+    elif ls["kind"] == "pending":
         i = ls["info"]
-        act_arrow = "🟢 BUY" if i["type"] == "Buy" else "🔴 SELL"
-        sig_ts = pd.Timestamp(i["sig_ts"])
-        L.append(f"  {act_arrow}  entry <b>{i['entry']:.2f}</b>   "
-                 f"<i>(level {i['level']:.2f})</i>")
-        L.append(f"  TP {i['tp']:.2f}   SL {i['sl']:.2f}")
-        L.append(f"  Sinyal muncul : {sig_ts:%d-%b-%Y %H:%M}")
-        # Measured against the wall clock, so a stale MT4 file is obvious
-        # rather than flattering the signal.
-        age_h = (real_now - sig_ts.to_pydatetime()).total_seconds() / 3600
-        L.append(f"  Berlaku sejak : {fmt_age(max(age_h, 0.0))} lalu")
-        if ls["kind"] == "pending":
-            sisa = max(0, (ttl - ls["bars_used"]) * 4)
-            L.append(f"  <b>STATUS: MENUNGGU TERISI</b>")
-            L.append(f"  Limit belum kena. Sisa {sisa} jam lagi.")
-            L.append(f"  → Pasang {i['type'].upper()} LIMIT di {i['entry']:.2f}")
-        else:
-            L.append(f"  <b>STATUS: POSISI BERJALAN</b> (sudah terisi)")
-            L.append(f"  Sudah {ls['bars_used']} lilin H4 berjalan.")
+        sisa = max(0, (ttl - ls["bars_used"]) * 4)
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        L.append(f"🟡 <b>ADA ORDER BELUM TERISI</b>")
         L.append("")
-        L.append("<b>Sinyal terakhir yang selesai</b>")
+        L.append(f"Pasang <b>{act} STOP/LIMIT</b> di:")
+        L.append(f"<code>{i['entry']:.2f}</code>")
+        L.append(f"TP <code>{i['tp']:.2f}</code>   SL <code>{i['sl']:.2f}</code>")
+        L.append(f"Sisa waktu: <b>{sisa} jam</b>")
+        L.append("<i>Tekan angkanya untuk menyalin.</i>")
+    elif ls["kind"] == "open":
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        L.append(f"🟢 <b>POSISI SEDANG BERJALAN</b> — {act}")
+        L.append("")
+        L.append(f"Entry <code>{i['entry']:.2f}</code>   "
+                 f"TP <code>{i['tp']:.2f}</code>   "
+                 f"SL <code>{i['sl']:.2f}</code>")
+        L.append(f"Sudah {ls['bars_used']} lilin H4 berjalan.")
+        L.append("<i>Biarkan jalan. Jangan tambah posisi.</i>")
     else:
-        L.append("  <b>TIDAK ADA SINYAL AKTIF</b>")
+        L.append("⚪ <b>TIDAK ADA YANG PERLU DIPASANG</b>")
         L.append("")
+        L.append("Tidak ada sinyal aktif. Nanti saya kirim sendiri kalau ada.")
 
-    if ls["kind"] != "flat":
-        L.append("  —")
-    L.append(f"  {arrow} entry {last['entry']:.2f}  (level {last['level']:.2f})")
-    L.append(f"  Hasil : <b>{last['result']}</b> ({last['pl_usd']:+.2f})")
-    L.append(f"  Muncul {pd.Timestamp(last['entry_time']):%d-%b %H:%M} → "
-             f"exit {pd.Timestamp(last['exit_time']):%d-%b %H:%M}")
-
-    # --- what is the method waiting for next? ----------------------------
+    # --- layar 1 lanjutan: apa yang sedang ditunggu ----------------------
     L.append("")
-    L.append("<b>Menunggu apa</b>")
-    L.append(f"  BUY bila 1 lilin H4 tutup di atas {'%.2f' % up if up else '-'}")
-    L.append(f"  SELL bila 1 lilin H4 tutup di bawah {'%.2f' % dn if dn else '-'}")
-    L.append("  <i>Entry limit 3.00 di belakang garis yang ditembus.</i>")
+    if up is not None:
+        L.append(f"BUY kalau tutup di atas <b>{up:.2f}</b>")
+    if dn is not None:
+        L.append(f"SELL kalau tutup di bawah <b>{dn:.2f}</b>")
+    L.append(f"<i>Harga sekarang {newest_close:.2f} (data "
+             f"{fmt_age(data_age_h)} lalu)</i>")
+    L.append("")
+
+    # --- layar 2: rincian untuk yang mau periksa -------------------------
+    L.append("➖➖➖ <i>rincian</i> ➖➖➖")
+    if data_age_h > 6:
+        L.append(f"⚠️ MT4 tidak memperbarui data.")
+    L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M}")
+    if up is not None:
+        L.append(f"Resistance terdekat : {up:.2f}  (+{up - newest_close:.2f})")
+    if dn is not None:
+        L.append(f"Support terdekat    : {dn:.2f}  ({dn - newest_close:+.2f})")
+    L.append(f"Trade terakhir ({arrow}) : <b>{last['result']}</b> "
+             f"({last['pl_usd']:+.2f}) · "
+             f"{pd.Timestamp(last['exit_time']):%d-%b %H:%M}")
+
 
     # --- health line ------------------------------------------------------
     st = load_state()
@@ -895,38 +894,36 @@ def cmd_poll() -> int:
         return 0
 
     answered = 0
-    handled = str(st.get("tg_handled", ""))
     for u in updates:
         msg = (u.get("message") or u.get("edited_message") or {})
         text = (msg.get("text") or "").strip().lower()
         cid = str((msg.get("chat") or {}).get("id", ""))
-        uid = str(u.get("update_id"))
-        if uid == handled:
-            continue
         if not text.startswith("/"):
             continue
         cmd = text.split()[0].split("@")[0]
-        if cmd not in ("/status", "/harga", "/price", "/signal", "/plan",
-                       "/rencana", "/mulai", "/start"):
-            continue
-        print(f"  {cmd} from {cid}")
-        if cmd in ("/mulai", "/start"):
+        # Anything the robot does not know still gets an answer, so a typo never
+        # looks like the robot is dead. This matters: silence is indistinguishable
+        # from a broken schedule.
+        if cmd in ("/mulai", "/start", "/help", "/bantuan"):
             reply = ("<b>Robot XAUUSD H4 aktif.</b>\n\n"
-                     "/status — harga sekarang & apakah ada sinyal\n"
-                     "/plan — rencana trading lengkap: entry, TP, SL, risiko\n\n"
-                     "Sinyal baru dikirim otomatis saat lilin H4 tutup.")
+                     "<b>/status</b> — apa yang harus saya pasang sekarang\n"
+                     "<b>/plan</b> — skenario lengkap: entry, TP, SL, risiko\n\n"
+                     "Sinyal baru saya kirim otomatis begitu lilin H4 tutup.\n"
+                     "<i>Ketik /status kapan saja, tidak perlu menunggu.</i>")
         elif cmd in ("/plan", "/rencana"):
             reply = build_plan_report()
-        else:
+        elif cmd in ("/status", "/harga", "/price", "/signal"):
             reply = build_status_report()
+        else:
+            reply = ("Perintah itu belum ada.\n\n"
+                     "<b>/status</b> — apa yang harus dipasang sekarang\n"
+                     "<b>/plan</b> — skenario entry, TP, SL, risiko")
         tg_send(token, cid or chat_id, reply)
-        handled = uid
         answered += 1
 
     # Storing the offset is what makes Telegram stop re-serving these messages,
     # so the same command can never be answered twice.
     st["tg_offset"] = updates[-1]["update_id"] + 1
-    st["tg_handled"] = handled
     save_state(st)
     print(f"answered {answered} message(s)")
     return 0
