@@ -1,0 +1,6 @@
+* text=auto
+
+# Windows batch files must keep CRLF or cmd.exe misreads them
+*.bat text eol=crlf
+*.py  text eol=lf
+*.md  text eol=lf
