@@ -100,6 +100,15 @@ python C:\Users\Sharing Vision\AppData\Local\hermes\trading\signal_live_h4.py --
 
 ## Cek cepat bahwa repo ini masih benar
 
+Cara termudah: **jalankan `SYNC.bat`.** Kalau dia bilang *"Tidak ada perubahan"*,
+berarti repo sudah sama persis dengan laptop. Kalau dia membuat commit baru,
+berarti ada yang tertinggal — dan commit itu yang harus di-push.
+
+`SYNC.bat` lalu `PUSH.bat` adalah satu-satunya urutan yang benar setelah ada
+perubahan apa pun.
+
+Pengecekan manual per file:
+
 ```bat
 cd C:\Users\Sharing Vision\Documents\OTHER\Testing
 for %f in (signal_live_h4.py xauusd_bundle.py xauusd_method_LOCKED.py xauusd_method_LOCKED_H4.py) do @fc /b trading\%f "C:\Users\Sharing Vision\AppData\Local\hermes\trading\%f"
