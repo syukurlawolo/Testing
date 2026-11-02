@@ -346,9 +346,9 @@ def fmt_signal(t: dict, now_bar) -> str:
     lines = [
         head,
         "",
-        f"<b>Entry</b>  {t['entry']:.2f}   (limit)",
-        f"<b>TP</b>       {t['tp']:.2f}   (+{dist:.2f})",
-        f"<b>SL</b>       {t['sl']:.2f}   (-{abs(t['entry'] - t['sl']):.2f})",
+        f"<b>Entry</b>  <code>{t['entry']:.2f}</code>   (limit)",
+        f"<b>TP</b>       <code>{t['tp']:.2f}</code>   (+{dist:.2f})",
+        f"<b>SL</b>       <code>{t['sl']:.2f}</code>   (-{abs(t['entry'] - t['sl']):.2f})",
         "",
         f"Level broken : <b>{t['level']:.2f}</b>",
         f"TP target    : {t['tp_level']:.2f}",
