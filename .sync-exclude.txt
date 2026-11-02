@@ -1,0 +1,8 @@
+.locks\
+.usage.json
+.usage.json.lock
+.bundled_manifest
+.curator_ledger.jsonl
+.curator_state
+__pycache__
+*.pyc
