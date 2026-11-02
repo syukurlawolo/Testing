@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.4.0
+version: 1.6.0
 author: Hermes Agent
 license: MIT
 ---
@@ -27,14 +27,6 @@ check) and for the traps that silently break the schedule.
 as the source of truth; the files in `trading/` are the working copies.
 
 **After changing ANY file the bundle embeds (especially `signal_live_h4.py` and
-
-## ntfy push (secondary channel)
-
-`signal_live_h4.py` sends every signal to Telegram **and** ntfy via `send_all()`.
-- Topic lives in `trading/ntfy.json` — **never commit it**; the topic name IS the secret (anyone who knows it can read and spoof signals).
-- Priority 5 (urgent) is reserved for new signals only; `/status` replies use 3. Never raise a routine reply to 5, or 'urgent' loses its meaning.
-- `ntfy_send()` strips Telegram HTML tags with `re.sub`, so the module must `import re` at top level (this was missed once — NameError on first real send).
-- `load_ntfy()` returns `{}` when the file is missing, so unconfigured ntfy never blocks Telegram. Verify redundancy by renaming `ntfy.json` and re-running `send_all()`: Telegram must still report True.
 the two `*_LOCKED*.py`), re-run `--verify`, then copy the rebuilt bundle over
 `assets/xauusd_bundle.py` and diff the two hashes.** They silently drift: the
 bundle in `trading/` was once rebuilt to v1.3.0 while the skill asset was still
@@ -112,6 +104,69 @@ otherwise the user reads the reply as "fixed" and hits the same silence again.
 listings is not a status: interpret the `Status` line from
 `schtasks /Query /V /FO LIST` as informative only and corroborate with
 `Last Run Time` + the newest log filename.
+
+### A second channel is for WAKING him; Telegram is for COPYING
+
+When the user asks for a push channel besides Telegram, add it as a redundant
+sink, never as a replacement: `send_all()` fans out to Telegram **and** ntfy and
+returns `{"telegram": bool, "ntfy": bool}`. One channel failing must never
+suppress the other — prove it by temporarily renaming the config file and
+re-running: Telegram must still report `True`.
+
+- **Priority is a contract, not a per-message choice.** Reserve `priority 5`
+  (urgent, overrides Do Not Disturb) for NEW SIGNALS ONLY; `/status`-class
+  replies use 3. If a routine reply is also urgent, the long vibration stops
+  meaning "there is a trade to place" and the user learns to ignore it.
+- **ntfy is plain text.** Telegram HTML tags must be stripped (`re.sub(r"<[^>]+>", "")`)
+  before sending, which means the module needs `import re` at top level —
+  omitting it is a NameError on the first real send.
+- **A missing config file disables the channel silently** (`load_ntfy()` returns
+  `{}`, `ntfy_send()` returns False) so an unconfigured push can never block the
+  primary channel. Never raise on it.
+- **The topic name IS the password.** Anyone who knows it can read the signals
+  and inject fakes. Keep it in `trading/ntfy.json` (never in the bundle, never in
+  the git repo — grep the repo for it before committing), and tell the user
+  plainly that it is a secret, not just a setting.
+- **Say what each channel is good for instead of pretending they are equal.**
+  ntfy wakes the phone; Telegram is where a number can be tapped and copied. If
+  the user complains "the numbers in ntfy can't be copied", do not fake it —
+  explain that Android notification text is not per-word selectable, and offer
+  either a tap-through to the Telegram message or keeping ntfy as the alarm only.
+
+### `/posisi` — what is running, what must be deleted, what just fired
+
+After a fill the user's real question is *"is this still my trade, or do I take
+it off?"*. Answer it as three labelled blocks, each ending in an imperative
+(`→ Aksi: biarkan` / `hapus ordernya`), never as one flat list:
+
+1. **Yang sedang berjalan** — 🟢 filled position ("biarkan, jangan diubah") and
+   🟡 unfilled pending ("biarkan menunggu", plus hours left).
+2. **Terjadi apa di lilin terakhir** — only the exits that happened on the newest
+   bar: ❌ HANGUS (TTL expired), ✅ TP, 🛑 SL. These are the delete-this ones.
+3. **Sinyal baru di lilin ini** — say "tidak ada" explicitly and add that waiting
+   is not a fault, otherwise silence looks like a broken robot.
+
+Implementation in `signal_live_h4.py`: `track_orders()` walks the bars once with
+the locked params and keeps finished AND live orders (each with `state`, `bar`,
+`sig_ts`, `exit_i`); `build_positions_report()` formats it. Register it in the
+`cmd_poll` dispatcher and in the `/help` and unknown-command fallback lists.
+
+- **Never do expiry arithmetic as `bars_left × 4`.** H4 bars skip the weekend, so
+  a bar count overstates the remaining window by days. Compute
+  `sig_ts + Timedelta(hours=TTL_BARS * 4)` against the newest bar's timestamp.
+- **Stale data invalidates every action line.** When the newest bar is older than
+  ~6h, print the DATA MATI warning above all three blocks and say the actions
+  below cannot be trusted — never let "biarkan posisi" be read as advice on a
+  market that has not been seen for hours.
+- **Test the report against truncated history, not only the live state.** The
+  current market is usually flat, so the "position running" and "pending"
+  branches never render. Re-run `build_positions_report()` with `read_hst`
+  monkey-patched to return `df.iloc[:cut]` for a bar where an order was live;
+  that is the only way to see the two branches actually produce text.
+
+The method is flat by design most of the time: silence plus "tidak ada order yang
+perlu dijaga" is the correct output, and telling the user so in one sentence
+prevents him from forcing trades.
 
 ### `cmd_poll` must answer EVERY command in the batch, and never stay silent
 
@@ -414,6 +469,14 @@ step-by-step story of what the robot does, not a code walkthrough and not a para
   "place it when the notification arrives, ~30s" or "build the MT4 EA that places it for you".
 - Close with a one-paragraph summary in plain speech — that is the version he will re-read.
 
+**Rule hypotheticals ("level A broken, then level B in the same candle — then what?").** His
+questions often describe two things the engine cannot do at once. Check the engine first, then
+run a ~25-line synthetic-bar simulation and show the printed trace, then name the false premise.
+The engine holds ONE slot, enforces a one-bar cooldown after an exit, confirms by CLOSE not
+touch, and resolves a bar that hits both SL and TP as SL. Worked example, the probe that shows
+the scenario is near-impossible on real data, and the answering shape are in
+`references/rule-questions-and-simulations.md`.
+
 Do not slip into restating the mechanics as a feature list, and do not soften the honest
 caveats: the high win rate comes from the 0.6 RR (win $30 / lose $18), not from superior
 prediction. Say that in the same breath as the WR figure.
@@ -585,7 +648,8 @@ procedure.
 | `config.json` | CSV path, Telegram token/chat id |
 | `signal_state.json` | Open position / pending order / closed trades |
 | `xauusd_STOP_variant_H4.py`, `xauusd_STOP_variant_H1.py` | Experiment copies of the two locked methods (stop instead of limit). Never in the bundle, never in the repo. See `references/order-type-experiment.md`. |
-| `signal_live_h4.py` | H4 Telegram bot: `--run` / `--poll` / `--status` / `--dry` / `--test` |
+| `signal_live_h4.py` | H4 Telegram bot: `--run` / `--poll` / `--status` / `--dry` / `--test`; `send_all()` fans out to Telegram + ntfy |
+| `ntfy.json` | Push topic + server for the second channel. **Secret — never in the bundle or the repo.** |
 | `xauusd_bundle.py` | Self-restoring bundle: 11 files base64-embedded, `--verify`/`--restore`/`--list`/`--diff` |
 | `run_signal.bat`, `poll_only.bat` | Scheduled runners; FULL absolute path to the venv python |
 | `register_tasks.bat` | Recreates both Windows scheduled tasks incl. `DisallowStartIfOnBatteries=false` |
@@ -719,6 +783,14 @@ the same way rather than leaving it implicit — see the ambiguity table in
 - **A scheduled task with no `Last Run` for hours is a host problem until proven
   otherwise**, but a scheduled task that was never tested is an agent problem.
   Check both before blaming the machine.
+
+## Task Scheduler: repetition needs `<Duration>`
+
+A `CalendarTrigger` with `<Repetition><Interval>PT5M</Interval></Repetition>` and **no `<Duration>`** never repeats — Windows reads the duration as zero. The task still reports `Status: Ready` and a `Next Run Time` that keeps advancing, so it looks healthy while never firing. `schtasks /Query /V` even prints `Repeat: Every: 0 Hour(s), 5 Minute(s)`, which is misleading.
+
+- Always include `<Duration>P1D</Duration>` inside `<Repetition>`.
+- Diagnose with `Last Run Time`, never `Next Run Time`: if `Last Run` is hours old while the machine was on and logged in, the repetition is dead.
+- Then prove it: count files in `trading/logs/run_*.log`, wait past two trigger boundaries, and confirm the count rises twice with no manual run.
 
 ## Reporting style for this user
 
