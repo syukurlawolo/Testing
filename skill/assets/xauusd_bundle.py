@@ -48,7 +48,7 @@ import sys
 from pathlib import Path
 
 BUNDLE_ID = "XAUUSD-LOCKED-BUNDLE"
-BUNDLE_VERSION = "1.8.0"
+BUNDLE_VERSION = "1.8.1"
 
 # Where the files belong, relative to the Hermes profile root.
 TARGET_DIR = Path(r"C:\Users\Sharing Vision\AppData\Local\hermes\trading")
@@ -66,7 +66,7 @@ EXPECTED = {
     "CEK_STATUS.bat": "c84c3d87b666221cae4137904badb746bb74e030c76a261c714bc2f586e64de1",   # support
     "register_tasks.bat": "2126290e0bbd6c2707aaa4420e682d377684435942722738f286539915c45468",   # support
     "PANDUAN.md": "bd8bec9654091d48f259e3b1c017750a4432050af2c07ac31cfac5b46b73c6c5",   # support
-    "signal_task.xml": "69ab7f6109c5b0edd45a99c335b956c03bc40ac9db7ae506822d0190a7dd0f56",   # support
+    "signal_task.xml": "9eac0e49fece0db40a10931cacf416f8cd4fa317455d33469de67208712e2cda",   # support
     "poll_task.xml": "4db23f047add423f1291a33b5310f234cf3331608dadc4cd426e8f2fa7bec300",   # support
     "signal_state.json": "ce5ddb3a441ea2096bbba3659cef2d35dc327633b217358c9d3c2e9ef0165ec7",   # state
 }
@@ -1868,30 +1868,30 @@ FILES = {
         "aWduYWw8L1VSST4KICA8L1JlZ2lzdHJhdGlvbkluZm8+CiAgPFRyaWdnZXJzPgogICAgPENhbGVu"
         "ZGFyVHJpZ2dlcj4KICAgICAgPFN0YXJ0Qm91bmRhcnk+MjAyNi0xMS0wMlQwNzowNTowMDwvU3Rh"
         "cnRCb3VuZGFyeT4KICAgICAgPEVuYWJsZWQ+dHJ1ZTwvRW5hYmxlZD4KICAgICAgPFJlcGV0aXRp"
-        "b24+CiAgICAgICAgPEludGVydmFsPlBUNU08L0ludGVydmFsPgogICAgICAgIDxTdG9wQXREdXJh"
-        "dGlvbkVuZD5mYWxzZTwvU3RvcEF0RHVyYXRpb25FbmQ+CiAgICAgIDwvUmVwZXRpdGlvbj4KICAg"
-        "ICAgPFNjaGVkdWxlQnlEYXk+CiAgICAgICAgPERheXNJbnRlcnZhbD4xPC9EYXlzSW50ZXJ2YWw+"
-        "CiAgICAgIDwvU2NoZWR1bGVCeURheT4KICAgIDwvQ2FsZW5kYXJUcmlnZ2VyPgogIDwvVHJpZ2dl"
-        "cnM+CiAgPFByaW5jaXBhbHM+CiAgICA8UHJpbmNpcGFsIGlkPSJBdXRob3IiPgogICAgICA8TG9n"
-        "b25UeXBlPkludGVyYWN0aXZlVG9rZW48L0xvZ29uVHlwZT4KICAgICAgPFJ1bkxldmVsPkxlYXN0"
-        "UHJpdmlsZWdlPC9SdW5MZXZlbD4KICAgIDwvUHJpbmNpcGFsPgogIDwvUHJpbmNpcGFscz4KICA8"
-        "U2V0dGluZ3M+CiAgICA8TXVsdGlwbGVJbnN0YW5jZXNQb2xpY3k+SWdub3JlTmV3PC9NdWx0aXBs"
-        "ZUluc3RhbmNlc1BvbGljeT4KICAgIDxEaXNhbGxvd1N0YXJ0SWZPbkJhdHRlcmllcz5mYWxzZTwv"
-        "RGlzYWxsb3dTdGFydElmT25CYXR0ZXJpZXM+CiAgICA8U3RvcElmR29pbmdPbkJhdHRlcmllcz5m"
-        "YWxzZTwvU3RvcElmR29pbmdPbkJhdHRlcmllcz4KICAgIDxBbGxvd0hhcmRUZXJtaW5hdGU+dHJ1"
-        "ZTwvQWxsb3dIYXJkVGVybWluYXRlPgogICAgPFN0YXJ0V2hlbkF2YWlsYWJsZT50cnVlPC9TdGFy"
-        "dFdoZW5BdmFpbGFibGU+CiAgICA8UnVuT25seUlmTmV0d29ya0F2YWlsYWJsZT5mYWxzZTwvUnVu"
-        "T25seUlmTmV0d29ya0F2YWlsYWJsZT4KICAgIDxJZGxlU2V0dGluZ3M+CiAgICAgIDxTdG9wT25J"
-        "ZGxlRW5kPmZhbHNlPC9TdG9wT25JZGxlRW5kPgogICAgICA8UmVzdGFydE9uSWRsZT5mYWxzZTwv"
-        "UmVzdGFydE9uSWRsZT4KICAgIDwvSWRsZVNldHRpbmdzPgogICAgPEFsbG93U3RhcnRPbkRlbWFu"
-        "ZD50cnVlPC9BbGxvd1N0YXJ0T25EZW1hbmQ+CiAgICA8RW5hYmxlZD50cnVlPC9FbmFibGVkPgog"
-        "ICAgPEhpZGRlbj5mYWxzZTwvSGlkZGVuPgogICAgPFJ1bk9ubHlJZklkbGU+ZmFsc2U8L1J1bk9u"
-        "bHlJZklkbGU+CiAgICA8V2FrZVRvUnVuPmZhbHNlPC9XYWtlVG9SdW4+CiAgICA8RXhlY3V0aW9u"
-        "VGltZUxpbWl0PlBUMjBNPC9FeGVjdXRpb25UaW1lTGltaXQ+CiAgICA8UHJpb3JpdHk+NzwvUHJp"
-        "b3JpdHk+CiAgPC9TZXR0aW5ncz4KICA8QWN0aW9ucyBDb250ZXh0PSJBdXRob3IiPgogICAgPEV4"
-        "ZWM+CiAgICAgIDxDb21tYW5kPkM6XFVzZXJzXFNoYXJpbmcgVmlzaW9uXEFwcERhdGFcTG9jYWxc"
-        "aGVybWVzXHRyYWRpbmdccnVuX3NpZ25hbC5iYXQ8L0NvbW1hbmQ+CiAgICA8L0V4ZWM+CiAgPC9B"
-        "Y3Rpb25zPgo8L1Rhc2s+Cg=="
+        "b24+CiAgICAgICAgPEludGVydmFsPlBUNU08L0ludGVydmFsPgogICAgICAgIDxEdXJhdGlvbj5Q"
+        "MUQ8L0R1cmF0aW9uPgogICAgICAgIDxTdG9wQXREdXJhdGlvbkVuZD5mYWxzZTwvU3RvcEF0RHVy"
+        "YXRpb25FbmQ+CiAgICAgIDwvUmVwZXRpdGlvbj4KICAgICAgPFNjaGVkdWxlQnlEYXk+CiAgICAg"
+        "ICAgPERheXNJbnRlcnZhbD4xPC9EYXlzSW50ZXJ2YWw+CiAgICAgIDwvU2NoZWR1bGVCeURheT4K"
+        "ICAgIDwvQ2FsZW5kYXJUcmlnZ2VyPgogIDwvVHJpZ2dlcnM+CiAgPFByaW5jaXBhbHM+CiAgICA8"
+        "UHJpbmNpcGFsIGlkPSJBdXRob3IiPgogICAgICA8TG9nb25UeXBlPkludGVyYWN0aXZlVG9rZW48"
+        "L0xvZ29uVHlwZT4KICAgICAgPFJ1bkxldmVsPkxlYXN0UHJpdmlsZWdlPC9SdW5MZXZlbD4KICAg"
+        "IDwvUHJpbmNpcGFsPgogIDwvUHJpbmNpcGFscz4KICA8U2V0dGluZ3M+CiAgICA8TXVsdGlwbGVJ"
+        "bnN0YW5jZXNQb2xpY3k+SWdub3JlTmV3PC9NdWx0aXBsZUluc3RhbmNlc1BvbGljeT4KICAgIDxE"
+        "aXNhbGxvd1N0YXJ0SWZPbkJhdHRlcmllcz5mYWxzZTwvRGlzYWxsb3dTdGFydElmT25CYXR0ZXJp"
+        "ZXM+CiAgICA8U3RvcElmR29pbmdPbkJhdHRlcmllcz5mYWxzZTwvU3RvcElmR29pbmdPbkJhdHRl"
+        "cmllcz4KICAgIDxBbGxvd0hhcmRUZXJtaW5hdGU+dHJ1ZTwvQWxsb3dIYXJkVGVybWluYXRlPgog"
+        "ICAgPFN0YXJ0V2hlbkF2YWlsYWJsZT50cnVlPC9TdGFydFdoZW5BdmFpbGFibGU+CiAgICA8UnVu"
+        "T25seUlmTmV0d29ya0F2YWlsYWJsZT5mYWxzZTwvUnVuT25seUlmTmV0d29ya0F2YWlsYWJsZT4K"
+        "ICAgIDxJZGxlU2V0dGluZ3M+CiAgICAgIDxTdG9wT25JZGxlRW5kPmZhbHNlPC9TdG9wT25JZGxl"
+        "RW5kPgogICAgICA8UmVzdGFydE9uSWRsZT5mYWxzZTwvUmVzdGFydE9uSWRsZT4KICAgIDwvSWRs"
+        "ZVNldHRpbmdzPgogICAgPEFsbG93U3RhcnRPbkRlbWFuZD50cnVlPC9BbGxvd1N0YXJ0T25EZW1h"
+        "bmQ+CiAgICA8RW5hYmxlZD50cnVlPC9FbmFibGVkPgogICAgPEhpZGRlbj5mYWxzZTwvSGlkZGVu"
+        "PgogICAgPFJ1bk9ubHlJZklkbGU+ZmFsc2U8L1J1bk9ubHlJZklkbGU+CiAgICA8V2FrZVRvUnVu"
+        "PmZhbHNlPC9XYWtlVG9SdW4+CiAgICA8RXhlY3V0aW9uVGltZUxpbWl0PlBUMjBNPC9FeGVjdXRp"
+        "b25UaW1lTGltaXQ+CiAgICA8UHJpb3JpdHk+NzwvUHJpb3JpdHk+CiAgPC9TZXR0aW5ncz4KICA8"
+        "QWN0aW9ucyBDb250ZXh0PSJBdXRob3IiPgogICAgPEV4ZWM+CiAgICAgIDxDb21tYW5kPkM6XFVz"
+        "ZXJzXFNoYXJpbmcgVmlzaW9uXEFwcERhdGFcTG9jYWxcaGVybWVzXHRyYWRpbmdccnVuX3NpZ25h"
+        "bC5iYXQ8L0NvbW1hbmQ+CiAgICA8L0V4ZWM+CiAgPC9BY3Rpb25zPgo8L1Rhc2s+Cg=="
     ),
     "poll_task.xml": (
         "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTE2Ij8+CjxUYXNrIHZlcnNpb249IjEu"

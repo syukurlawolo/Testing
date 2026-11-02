@@ -10,6 +10,7 @@
       <Enabled>true</Enabled>
       <Repetition>
         <Interval>PT5M</Interval>
+        <Duration>P1D</Duration>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
       <ScheduleByDay>
