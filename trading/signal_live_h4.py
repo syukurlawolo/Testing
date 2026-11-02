@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -72,6 +73,11 @@ CONFIG_CANDIDATES = [
 STATE_FILE = HERE / "signal_state.json"
 LOG_FILE = HERE / "signals_log.jsonl"
 LOCK_FILE = HERE / "signal_live.lock"
+
+# ntfy: phone push that cannot be silently muted like Telegram can.
+# The topic is a shared secret - anyone who knows it can read the signals.
+NTFY_FILE = HERE / "ntfy.json"
+NTFY_SERVER = "https://ntfy.sh"
 
 # MT4 terminal data folders to search for XAUUSD240.hst
 MT4_ROOTS = [
@@ -267,6 +273,74 @@ def sig_key(t: dict) -> str:
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
+
+
+def load_ntfy() -> dict:
+    """
+    Read the ntfy topic. Absent file = ntfy silently disabled, never an error:
+    the bot must keep delivering to Telegram even if push is not configured.
+    """
+    try:
+        cfg = json.loads(NTFY_FILE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    topic = str(cfg.get("topic") or "").strip()
+    if not topic:
+        return {}
+    return {"topic": topic,
+            "server": str(cfg.get("server") or NTFY_SERVER).rstrip("/")}
+
+
+def ntfy_send(text: str, title: str = "XAUUSD", priority: int = 3,
+              tags: list | None = None, dry: bool = False) -> bool:
+    """
+    Push to the phone through ntfy.
+
+    priority 5 (urgent) pops over other apps and can override Do Not Disturb -
+    reserved for NEW SIGNALS. /status answers use 3, so the urgent channel keeps
+    its meaning: urgent only ever means 'there is a trade to place'.
+    Telegram HTML tags are stripped, because ntfy shows plain text.
+    """
+    cfg = load_ntfy()
+    if not cfg:
+        return False
+    plain = re.sub(r"<[^>]+>", "", text)
+    plain = (plain.replace("&amp;", "&").replace("&lt;", "<")
+                  .replace("&gt;", ">").replace("&quot;", '"'))
+    if dry:
+        print(f"\n--- NTFY DRY RUN (not sent, priority {priority}) ---\n"
+              f"{title}\n{plain}\n--------------------------")
+        return True
+    body = json.dumps({
+        "topic": cfg["topic"], "title": title, "message": plain,
+        "priority": priority, "tags": tags or [],
+    }).encode()
+    req = urllib.request.Request(
+        cfg["server"] + "/", data=body,
+        headers={"Content-Type": "application/json"})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return 200 <= r.status < 300
+        except Exception as e:
+            if attempt == 2:
+                print(f"ntfy send failed after 3 tries: {e}")
+                return False
+            time.sleep(2 * (attempt + 1))
+    return False
+
+
+def send_all(text: str, title: str = "XAUUSD", priority: int = 3,
+             tags: list | None = None, dry: bool = False) -> dict:
+    """
+    Deliver through every configured channel. One channel failing must never
+    stop the other: the whole point of two channels is redundancy.
+    """
+    cfg = load_config()
+    tg_ok = tg_send(cfg.get("token", ""), cfg.get("chat_id", ""), text,
+                    dry=dry, loud=(priority >= 5))
+    nt_ok = ntfy_send(text, title=title, priority=priority, tags=tags, dry=dry)
+    return {"telegram": tg_ok, "ntfy": nt_ok}
 
 
 def tg_send(token: str, chat_id: str, text: str, dry: bool = False,
@@ -921,7 +995,8 @@ def cmd_poll() -> int:
             reply = ("Perintah itu belum ada.\n\n"
                      "<b>/status</b> — apa yang harus dipasang sekarang\n"
                      "<b>/plan</b> — skenario entry, TP, SL, risiko")
-        tg_send(token, cid or chat_id, reply)
+        # /status answers are priority 3: they must never look like a signal.
+        send_all(reply, title="Status XAUUSD", priority=3)
         answered += 1
 
     # Storing the offset is what makes Telegram stop re-serving these messages,
@@ -1070,11 +1145,15 @@ def _run(dry: bool = False) -> int:
     sent_ok = 0
     for t in r["new"]:
         msg = fmt_signal(t, r["last_bar"])
-        # loud=True: a signal must make a sound. Routine replies must not.
-        ok = tg_send(cfg["token"] if cfg else "", cfg["chat_id"] if cfg else "",
-                     msg, dry=dry, loud=True)
+        # priority 5 = urgent: pops over other apps, can beat Do Not Disturb.
+        # Only ever used for a real signal, so 'urgent' keeps its meaning.
+        act = "BUY" if t["action"] == "Buy" else "SELL"
+        res = send_all(msg, title=f"SINYAL {act} XAUUSD · entry {t['entry']:.2f}",
+                       priority=5, tags=["chart_with_upwards_trend"], dry=dry)
+        ok = res["telegram"] or res["ntfy"]
         print(f"  {'SENT' if ok else 'FAILED'}: {t['action']} "
-              f"{t['entry']:.2f} TP {t['tp']:.2f} SL {t['sl']:.2f}")
+              f"{t['entry']:.2f} TP {t['tp']:.2f} SL {t['sl']:.2f} "
+              f"(telegram={res['telegram']} ntfy={res['ntfy']})")
         if ok and not dry:
             k = sig_key(t)
             if k not in st.setdefault("sent", []):
