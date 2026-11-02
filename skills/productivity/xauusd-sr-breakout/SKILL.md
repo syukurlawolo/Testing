@@ -1,6 +1,9 @@
 ---
 name: xauusd-sr-breakout
-description: Use for XAUUSD S/R breakout backtests, live signals, and restoring the frozen system.
+description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
+version: 1.4.0
+author: Hermes Agent
+license: MIT
 ---
 
 # XAUUSD S/R Breakout — FROZEN Strategy `XAUUSD-SR-BREAKOUT-CAP30`
@@ -24,17 +27,119 @@ check) and for the traps that silently break the schedule.
 as the source of truth; the files in `trading/` are the working copies.
 
 **After changing ANY file the bundle embeds (especially `signal_live_h4.py` and
+
+## ntfy push (secondary channel)
+
+`signal_live_h4.py` sends every signal to Telegram **and** ntfy via `send_all()`.
+- Topic lives in `trading/ntfy.json` — **never commit it**; the topic name IS the secret (anyone who knows it can read and spoof signals).
+- Priority 5 (urgent) is reserved for new signals only; `/status` replies use 3. Never raise a routine reply to 5, or 'urgent' loses its meaning.
+- `ntfy_send()` strips Telegram HTML tags with `re.sub`, so the module must `import re` at top level (this was missed once — NameError on first real send).
+- `load_ntfy()` returns `{}` when the file is missing, so unconfigured ntfy never blocks Telegram. Verify redundancy by renaming `ntfy.json` and re-running `send_all()`: Telegram must still report True.
 the two `*_LOCKED*.py`), re-run `--verify`, then copy the rebuilt bundle over
 `assets/xauusd_bundle.py` and diff the two hashes.** They silently drift: the
-bundle in `trading/` was rebuilt to v1.3.0 while the skill asset was still
+bundle in `trading/` was once rebuilt to v1.3.0 while the skill asset was still
 v1.1.0, so a reinstall would have restored the buggy pre-fix signal engine.
+Discipline: after every approved change, three copies must be hash-identical —
+`trading/xauusd_bundle.py`, `<skill>/assets/xauusd_bundle.py`, and the copy in
+the git repo — and each one must separately pass `--verify` on its own.
+
+A drift check the user can see, not just a claim: print both sha256 side by side
+and the word IDENTIK/BERBEDA, then run `--verify` from the skill copy. When they
+differ, the skill copy is the one that matters — it is the copy a reinstall
+leaves behind.
 
 ### Never let a scheduled helper delete itself
 
-One-off demo senders must not `del "%~f0"` or `os.remove(__file__)`. The 18:10
-proof-of-life demo did exactly that and left the user with nothing to inspect.
-Leave the script in place, mark the task as fired (the script's own time-window
-guard is enough), and clean up only when the user asks.
+One-off demo senders must not `del "%~f0"` or `os.remove(__file__)`. Any script
+that proves a path works (scheduled send, restore, health check) is the evidence
+a future session needs; a self-deleting helper leaves the user with nothing to
+inspect and the agent unable to reproduce it. Leave the script in place, guard
+it with its own time window so it cannot re-fire, and clean up only when the
+user asks. The same rule applies to helpers written for a single demonstration
+only — write them as keepable files from the start, because "temporary" scripts
+become permanent the moment the user says *keep everything*.
+
+### The git repo IS the anti-amnesia contract — keep it synced
+
+When the user's standing requirement is "kalau Hermes amnesia, saya tinggal
+panggil git-nya", the repo is not a backup artefact, it is the boot contract.
+It must hold, all at once: the full `trading/` tree, the method skill, **every
+Hermes skill** under `skills/`, the reference data, and a `PULIHKAN.md` written
+so that "paste one sentence to Hermes" restores the system without any
+conversation history. Ship a `SYNC.bat` (laptop → repo, auto-commit) next to the
+user's `PUSH.bat`, and treat *sync clean = no new commit on a second run* as the
+proof that the repo equals the live machine. Recipe, including the copy trap
+that wipes the backup, is in `references/repo-sync-to-git.md`.
+
+**Any change to `signal_live_h4.py`, either `*_LOCKED*.py`, a runner `.bat`, or
+the skill itself is not finished until `SYNC.bat` runs clean.** A hash-equal
+`trading/` with a stale repo restores the wrong engine on the next reinstall —
+this has already happened once with the v1.1.0/v1.3.0 bundle split.
+
+### Scheduled tasks stop silently — `Next Run Time` is not evidence of life
+
+The trigger can keep advancing `Next Run Time` (19:15 → 19:25 → 19:30) while
+`Last Run Time` and every file in `trading/logs/` stay frozen for hours, with
+`Status: Ready` and `Last Result: 0` throughout. Sleeping through a due time is
+not proof either — a `sleep` in your own shell keeps running with the screen
+locked. The only trustworthy check is `Last Run Time` plus the newest log
+timestamp, and the fix is `schtasks /Run` only as a stopgap.
+
+When the user wants instant `/status` answers or signals that survive a locked
+screen, propose replacing the 5-minute schedule with a long-lived background
+process that polls Telegram every few seconds and autostarts with Windows. Say
+plainly that its cost is one live Python process the machine must keep running.
+
+The two remedies are NOT interchangeable, so name the failing one correctly:
+repairing the trigger only helps if the trigger is at fault; a trigger that is
+merely being pre-empted by sleep/lock recovers on its own as soon as the machine
+is awake, so "fix the schedule" would change nothing. Diagnose first, then pick.
+
+#### Draining the Telegram queue is a DIAGNOSTIC, not the fix
+
+Running `signal_live_h4.py --poll` by hand proves the code path and clears the
+queue, so the user sees a reply and the incident looks closed while the trigger
+stays broken. Always state the distinction in the same message — a manual poll
+success is evidence about the code, never evidence that the schedule works —
+otherwise the user reads the reply as "fixed" and hits the same silence again.
+
+- **The Telegram queue is the evidence, so read it before touching anything.**
+  `getUpdates` with **no** offset returns pending updates *and leaves them in the
+  queue*. Run that first: a `/status` still sitting there with a timestamp older
+  than the last scheduled slot proves nothing consumed it — that separates a dead
+  schedule from a send failure, and it dates the request precisely. Only then may
+  you drain with `--poll`, and you must label that reply as a diagnostic, not a fix. `<status>` in task
+listings is not a status: interpret the `Status` line from
+`schtasks /Query /V /FO LIST` as informative only and corroborate with
+`Last Run Time` + the newest log filename.
+
+### `cmd_poll` must answer EVERY command in the batch, and never stay silent
+
+Draining advances `tg_offset` past *every* pending update, so any command the loop
+`continue`s over is destroyed, not deferred. Two ways this bites:
+
+- **Per-update dedupe destroys siblings.** A `handled` / `uid == handled` marker that
+  stores only the last answered `update_id` skips the earlier messages of the same
+  batch, and the offset then marks them consumed. Answer every recognized command in
+  the loop and rely on `tg_offset` alone for dedupe — that is what it is for.
+- **An unknown command must still get a reply.** `continue` on anything not in the
+  allow-list makes a typo (`/statuss`) indistinguishable from a dead robot. Reply with
+  the command list instead: as long as *something* comes back, the user knows the
+  schedule works.
+
+When the user asks "how long should I wait for /status?", give numbers, not a
+paragraph: 0 to one poll interval (5 min by default) is normal, ~2.5 min is typical,
+and **more than 10 min means blocked, not slow**. Add that `/status` replies are sent
+silently by design — the user must open the chat, waiting for a notification guarantees
+a false "it didn't work".
+
+A dropped reply the user waited for is a defect in the robot, not a cosmetic quirk: say
+so plainly at the top of the reply, before explaining the schedule, otherwise the silent
+drop gets blamed on Windows.
+
+When answering, first read the Telegram queue (`getUpdates` with no offset) and
+compare the stored `tg_offset`; a message still sitting there proves nothing
+consumed it, which separates a dead schedule from a send failure.
 
 ### A bundle cannot contain itself — always stage the script outside its target
 
@@ -49,9 +154,22 @@ that would fix things is gone too. Two rules follow:
   being packaged and read it from that copy — the packaged tree will not include
   it, and `cp` on it after a wipe fails with "No such file or directory".
 
-When you change the bundle's own behaviour, the new bundle must be rebuilt from
-the regenerated skeleton, not hand-edited: the embedded base64 blocks make any
+When you change the bundle's own behaviour, the new bundle must be rebuilt from the
+regenerated skeleton, not hand-edited: the embedded base64 blocks make any
 manual edit a corruption risk. Regenerate, then re-run all four subcommands.
+
+**The skeleton rarely survives** — builders stage it in the pruned scratch dir, so
+almost always the rebuild script is gone while the bundle is not. Do not stop there
+and do not rewrite the bundle by hand: patch the embedded entry programmatically.
+The bundle is plain Python holding `{name: sha256}` in an `EXPECTED` dict plus a
+`{name: ("<base64 chunk>", ...)}` payload block per file, so the edit is exactly
+four steps — (a) hash the changed file, (b) replace its hash line in `EXPECTED`,
+(c) regex out its payload block (`"<name>": \(\n(?:        "[^"]*"\n)+\)`) and
+substitute a freshly wrapped base64 block at 76 chars per line, (d) bump
+`BUNDLE_VERSION`. Then prove it: `--verify` must report every file matching, and
+the same new hash must appear in all three copies (`trading/`, skill `assets/`,
+git repo). `--verify` OK is the proof the payload decodes and matches — a hand
+typed bundle that fails it is the only real corruption risk.
 
 ### Distinguish file hash from lock hash in every report
 
@@ -113,6 +231,62 @@ Lessons learned the hard way — do not re-break these:
   is generated by the rules and what was typed by you.
 - `.bat` log filenames must not contain `%TIME%` colons; build a stamp from
   `wmic os get localdatetime` instead.
+- **A platform that only offers a mobile app has no automation path worth promising.**
+  When the user describes a click-by-click flow in a phone app (open app → enable
+  location → tap "post signal" → pick channel → pick symbol → OK) and asks "any idea
+  how to automate this?", answer in three tiers and do not merge them: (1) UI
+  automation of the phone (Accessibility/Appium) — say plainly it is fragile: every
+  app update moves the buttons, the phone must stay awake and unlocked, and platform
+  rules may treat it as a violation with the user's account at stake; (2) half-
+  automatic — the robot formats the signal so it can be pasted into the app, cutting
+  the work to seconds with no fragility; (3) execute on the user's own account via
+  MT4 instead, which needs no app at all. Then ask which one, and **which revenue the
+  user is actually after** (subscribers to the channel vs profit from their own
+  account) — the right tier depends entirely on that answer, and guessing it wastes
+  the session. Check whether the platform has a web version before proposing phone
+  automation at all: a browser flow is repeatable where screen-tapping is not.
+#### `/status` is read in five seconds — lead with the ACTION, not the data
+
+This user tunes `/status` by telling you to "make the words easier". The shape that works:
+
+1. **One verdict line with a traffic light**, then nothing else until the action.
+   🔴 `DATA MATI — jangan trading` (data older than ~6h) · 🟡 `ADA ORDER BELUM TERISI`
+   · 🟢 `POSISI SEDANG BERJALAN` · ⚪ `TIDAK ADA YANG PERLU DIPASANG`.
+2. **The order to place, in imperative.** `Pasang BUY STOP/LIMIT di:` then the entry
+   alone on its line as `<code>`, then `TP … SL …` on one line, then `Sisa waktu: N jam`.
+   These are the only copyable values — same `<code>`-only rule as the signal message.
+3. **What is being waited for, in conditional language.** `BUY kalau tutup di atas X` /
+   `SELL kalau tutup di bawah Y` — the level, not the technical term "resistance".
+4. **`➖➖➖ rincian ➖➖➖`, then everything else.** Last candle time, nearest levels with
+   distance, the last finished trade's result, and the method id/version/health line go
+   BELOW the divider so the user can stop reading at the top.
+
+Banned in the top half: the words limit/breakout/close/resistance as labels, indentation-led
+key/value blocks, and the same fact stated twice (price used to appear in the header *and* in
+the signal block). Strip `real_now`/age arithmetic to a single parenthetical
+`(data 4.3 jam lalu)` — say `jam`, not `h`.
+
+- **Signal numbers must be individually copyable.** This user posts signals into a
+phone app with three separate fields (entry / SL / TP), so he wants to tap *one
+number* and paste it into *one field* — not copy the whole message. Wrap only the
+bare number in `<code>` and leave the labels and the deltas as normal text:
+  `f"<b>Entry</b>  <code>{t['entry']:.2f}</code>   (limit)"`. Telegram copies a
+  `<code>` span on tap in the mobile client, which is why this works without
+  inline buttons. Offer this layout before writing it and say the cost — the
+  numbers render in a slightly boxed monospace style. Do not add copy buttons,
+  do not wrap the labels, and do not make a wall of tappable fields: the user
+  asked for the numbers, so only the numbers.
+
+Patch it in `signal_live_h4.py` (`fmt_signal`), then prove the render by calling
+`fmt_signal()` on a hand-built signal dict and printing it — never screenshot-guess
+the HTML. Each new-format feature gets one Telegram message titled as a
+**CONTOH TAMPILAN — BUKAN SINYAL** with invented numbers in it, so the user can
+test the tap without wondering whether a real signal just arrived.
+- **The final line of a signal says where the order goes, not just its price.**
+  When the robot's output is pasted by a human, end the message with the single
+  action to perform (`→ Pasang BUY LIMIT di 3905.42`) and the expiry rule in
+  plain words (`Batalkan kalau belum terisi dalam 8 jam`). The trader reads the
+  last line, not the table.
 
 ## TWO LOCKED FILES — H1 and H4 are siblings, never parent/child
 
@@ -205,7 +379,8 @@ common** with the locked method. Every figure previously quoted from it — incl
   See `references/live-deployment.md` — read it before advising on hosting, scheduling, or EA design.
 - Publishing, mirroring, or restoring the system to another machine or repo. Read
   `references/publish-and-verify.md` for what ships, what never ships, and the
-  clone-based verification that must pass before calling a push done.
+  clone-based verification that must pass before calling a push done. For a repo
+  meant to survive an amnesiac Hermes, also read `references/repo-sync-to-git.md`.
 - Any request to quote this strategy's win rate, Profit Factor, or drawdown.
 - Building, scheduling, or debugging the Telegram signal robot. Read
   `references/live-deployment.md` first — it carries the `.hst` decoder, the Windows
@@ -228,7 +403,15 @@ step-by-step story of what the robot does, not a code walkthrough and not a para
   break-even moves, no news, no lot sizing). The boundary is the most-repeated question.
 - Correct wrong mental models explicitly rather than quietly using the right term: this user
   called it an "entry stop" — it is a **limit** order, and the why (it waits for price to come
-  back $3 to the level instead of chasing) is the substance of the correction.
+  back $3 to the level instead of chasing) is the substance of the correction. That correction
+  alone is not enough; he will then ask for the stop version to be *tested*. Answer with the
+  files and the measured breakdown, never with "stop is worse" or "stop is better" from theory
+  — the empirical answer is in `references/order-type-experiment.md`.
+- After the stop test comes back a tie, he will ask the practical follow-ups — *can I place it
+  beforehand, far before the breakout?* Answer the two-level confusion directly: the **level** is
+  static, the **entry** is only valid once a bar CLOSES beyond it, so placing a buy-stop *and* a
+  sell-stop in advance is a different (untested) method, not his. The honest offer is either
+  "place it when the notification arrives, ~30s" or "build the MT4 EA that places it for you".
 - Close with a one-paragraph summary in plain speech — that is the version he will re-read.
 
 Do not slip into restating the mechanics as a feature list, and do not soften the honest
@@ -400,9 +583,10 @@ procedure.
 | `verify_frozen.py` | Proves strategy intact + reproduces backtest |
 | `signal_service.py` | HTTP bridge for n8n / external callers |
 | `config.json` | CSV path, Telegram token/chat id |
-| `state.json` | Open position / pending order / closed trades |
+| `signal_state.json` | Open position / pending order / closed trades |
+| `xauusd_STOP_variant_H4.py`, `xauusd_STOP_variant_H1.py` | Experiment copies of the two locked methods (stop instead of limit). Never in the bundle, never in the repo. See `references/order-type-experiment.md`. |
 | `signal_live_h4.py` | H4 Telegram bot: `--run` / `--poll` / `--status` / `--dry` / `--test` |
-| `xauusd_bundle.py` | Self-restoring bundle: 9 files base64-embedded, `--verify`/`--restore`/`--list`/`--diff` |
+| `xauusd_bundle.py` | Self-restoring bundle: 11 files base64-embedded, `--verify`/`--restore`/`--list`/`--diff` |
 | `run_signal.bat`, `poll_only.bat` | Scheduled runners; FULL absolute path to the venv python |
 | `register_tasks.bat` | Recreates both Windows scheduled tasks incl. `DisallowStartIfOnBatteries=false` |
 | `CEK_STATUS.bat` | Manual health check: status + both verifiers + schedule |
@@ -443,6 +627,10 @@ The user asks for a target WR ("get me 57%"). The efficient path, in order:
    "59%" honestly means "50–68%".
 7. **Charge realistic cost.** Gold round-trip ≈ $0.3–1.0/oz. At $5.35/trade the system survives
    $2; at $1.40/trade it does not.
+8. **Do not bother sweeping the order type.** Limit vs stop is *identical* on this method
+   (346/346 trades, byte-identical CSV) because the breakout bar almost always closes past
+   `level ± $3` already. Effort belongs on buffer, cap, and RR instead. Evidence and the
+   reusable method for running any such variant test: `references/order-type-experiment.md`.
 
 If steps 2–4 fail, deliver it as a **CANDIDATE** with the failing check recorded in the
 strategy JSON and **asserted by the verifier** so the caveat cannot be quietly dropped later.
@@ -520,6 +708,17 @@ the same way rather than leaving it implicit — see the ambiguity table in
 - **`--export` fails with a bare `PermissionError` when the target CSV is open in Excel.**
   Write to a different `--out` and `cmp` it against the reference instead of telling the user
   the export broke.
+
+- **Never claim an automation works because you wrote it.** A scheduled task, a
+  sync script, or a `.bat` is proven only by running it and reading the result;
+  run it a second time to prove it is idempotent. Stating "done" before the
+  first execution has already happened is a defect this user catches, and he
+  reads a quiet change of state as a lie, not an oversight. When you find such a
+  mistake in yourself, name it plainly at the top of the reply before the
+  results table.
+- **A scheduled task with no `Last Run` for hours is a host problem until proven
+  otherwise**, but a scheduled task that was never tested is an agent problem.
+  Check both before blaming the machine.
 
 ## Reporting style for this user
 
