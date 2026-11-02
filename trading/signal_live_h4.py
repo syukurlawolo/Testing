@@ -618,57 +618,60 @@ def build_status_report() -> str:
     up = next_level_up(newest_close, mod.RED_LEVELS)
     dn = next_level_down(newest_close, mod.RED_LEVELS)
 
+    # --- jawabannya: rencana pasang order, dua arah -----------------------
     L = []
     L.append(f"<b>STATUS XAUUSD</b> · {datetime.now().strftime('%d-%b %H:%M')} WIB")
     L.append("")
 
-    # --- layar 1: jawabannya saja, tanpa bahasa teknis -------------------
     if data_age_h > 6:
-        L.append("🔴 <b>DATA MATI — jangan trading.</b>")
-        L.append("MT4 tidak memperbarui harga. Buka MT4, login, tunggu.")
-        L.append(f"<i>Harga terakhir {newest_close:.2f} dari "
-                 f"{fmt_age(data_age_h)} lalu.</i>")
-    elif ls["kind"] == "pending":
+        L.append("🔴 <b>DATA MATI — JANGAN PASANG APA PUN.</b>")
+        L.append("MT4 tidak memperbarui harga. Buka MT4, login, lalu ketik /status lagi.")
+        L.append(f"<i>Harga terakhir {newest_close:.2f} dari {fmt_age(data_age_h)} lalu.</i>")
+        L.append("")
+        L.append("➖➖➖ <i>rincian</i> ➖➖➖")
+        L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M}")
+        return "\n".join(L)
+
+    sc = plan_scenarios(newest_close, mod, ls)
+    buy = next((s for s in sc if s["side"] == "BUY"), None)
+    sell = next((s for s in sc if s["side"] == "SELL"), None)
+
+    L.append(f"Harga sekarang <b>{newest_close:.2f}</b>")
+    if ls["kind"] != "flat":
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        L.append(f"<i>Ada sinyal {act} aktif — lihat pesan sinyalnya.</i>")
+    L.append("")
+    L.append("<b>Rencana pasang order</b>")
+    L.append("<i>Pasang semua yang ada di bawah, dua arah sekaligus.</i>")
+    L.append("<i>Yang satu kena, batalkan yang lain.</i>")
+    L.append("")
+    for s, nm in ((sell, "SELL"), (buy, "BUY")):
+        if s is None:
+            continue
+        emoji = "🔴" if nm == "SELL" else "🟢"
+        L.append(f"{emoji} <b>{nm}</b>")
+        L.append(f"Entry <code>{s['entry']:.2f}</code>")
+        L.append(f"SL <code>{s['sl']:.2f}</code>")
+        L.append(f"TP <code>{s['tp']:.2f}</code>")
+        L.append("")
+    L.append("<i>Tekan angkanya untuk menyalin.</i>")
+    L.append("")
+
+    if ls["kind"] == "pending":
         i = ls["info"]
         sisa = max(0, (ttl - ls["bars_used"]) * 4)
-        act = "BUY" if i["type"] == "Buy" else "SELL"
-        L.append(f"🟡 <b>ADA ORDER BELUM TERISI</b>")
+        L.append(f"⚠️ Sinyal {i['type'].upper()} aktif tersisa <b>{sisa} jam</b> "
+                 f"bila belum terisi.")
         L.append("")
-        L.append(f"Pasang <b>{act} STOP/LIMIT</b> di:")
-        L.append(f"<code>{i['entry']:.2f}</code>")
-        L.append(f"TP <code>{i['tp']:.2f}</code>   SL <code>{i['sl']:.2f}</code>")
-        L.append(f"Sisa waktu: <b>{sisa} jam</b>")
-        L.append("<i>Tekan angkanya untuk menyalin.</i>")
-    elif ls["kind"] == "open":
-        i = ls["info"]
-        act = "BUY" if i["type"] == "Buy" else "SELL"
-        L.append(f"🟢 <b>POSISI SEDANG BERJALAN</b> — {act}")
-        L.append("")
-        L.append(f"Entry <code>{i['entry']:.2f}</code>   "
-                 f"TP <code>{i['tp']:.2f}</code>   "
-                 f"SL <code>{i['sl']:.2f}</code>")
-        L.append(f"Sudah {ls['bars_used']} lilin H4 berjalan.")
-        L.append("<i>Biarkan jalan. Jangan tambah posisi.</i>")
-    else:
-        L.append("⚪ <b>TIDAK ADA YANG PERLU DIPASANG</b>")
-        L.append("")
-        L.append("Tidak ada sinyal aktif. Nanti saya kirim sendiri kalau ada.")
 
-    # --- layar 1 lanjutan: apa yang sedang ditunggu ----------------------
-    L.append("")
-    if up is not None:
-        L.append(f"BUY kalau tutup di atas <b>{up:.2f}</b>")
-    if dn is not None:
-        L.append(f"SELL kalau tutup di bawah <b>{dn:.2f}</b>")
-    L.append(f"<i>Harga sekarang {newest_close:.2f} (data "
-             f"{fmt_age(data_age_h)} lalu)</i>")
-    L.append("")
-
-    # --- layar 2: rincian untuk yang mau periksa -------------------------
     L.append("➖➖➖ <i>rincian</i> ➖➖➖")
-    if data_age_h > 6:
-        L.append(f"⚠️ MT4 tidak memperbarui data.")
-    L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M}")
+    L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M} "
+             f"(data {fmt_age(data_age_h)} lalu)")
+    L.append("Syarat sinyal: 1 lilin H4 <b>tutup</b> melewati garis level.")
+    for s in sc:
+        L.append(f"  {s['side']} lahir bila tutup di "
+                 f"{'atas' if s['side'] == 'BUY' else 'bawah'} {s['level']:.2f}")
     if up is not None:
         L.append(f"Resistance terdekat : {up:.2f}  (+{up - newest_close:.2f})")
     if dn is not None:
