@@ -36,8 +36,14 @@ xcopy "%H%\skills\productivity\xauusd-sr-breakout\assets\*"     "%REPO%skill\ass
 
 REM --- 3. SELURUH skill -------------------------------------------------
 echo [3/4] skills\ (semua skill) ...
-if exist "%REPO%skills" rmdir /S /Q "%REPO%skills"
-xcopy "%H%\skills\*" "%REPO%skills\" /E /Y /Q /EXCLUDE:"%REPO%.sync-exclude.txt" >nul
+REM  NOTE: xcopy is SKIPPED here on purpose. It cannot copy a folder into a
+REM  folder of the same name, so it silently wipes the backup. Use robocopy.
+REM  /MIR mirrors exactly: deletes what no longer exists in hermes.
+robocopy "%H%\skills" "%REPO%skills" /MIR /NFL /NDL /NJH /NJS /NP /XD ".locks" "__pycache__" /XF ".usage.json" ".usage.json.lock" ".bundled_manifest" ".curator_ledger.jsonl" ".curator_state" "*.pyc" "*.lock" >nul
+if errorlevel 8 (
+    echo   ROBCOPY GAGAL - backup skill TIDAK terbarui. Batalkan push.
+    goto :end
+)
 
 REM --- 4. commit --------------------------------------------------------
 echo [4/4] commit ...
@@ -60,4 +66,5 @@ echo ------------------------------------------------------------
 echo   Selesai. Untuk mengirim ke GitHub: jalankan PUSH.bat
 echo ------------------------------------------------------------
 echo.
+:end
 pause
