@@ -20,14 +20,25 @@ The bundle is also kept (byte-identical) at:
   - C:\Users\Sharing Vision\Documents\OTHER\agen\xauusd_bundle.py
   - <this skill>\assets\xauusd_bundle.py            <-- survives reinstall
 
-Any single copy can rebuild everything. They are all sha256 9376a7db v1.1.0
-(re-verify after any approved change; the number WILL change then).
+Any single copy can rebuild everything. They must all be the SAME bundle —
+check with `sha256sum` on each and expect one hash to appear across all copies
+(currently `3b9dfc5b…`, v1.4.0 — numbers move with every approved change; the
+real check is that all copies agree).
+
+If the copies disagree, the skill asset is the one to trust after a reinstall
+and the `trading/` copy is the one the live robot runs. Rebuild once, copy it
+over all four locations, and re-check. A stale copy has already shipped here
+once (v1.1.0 in the skill, v1.3.0 live) and would have restored the pre-fix
+signal engine.
 
 FROZEN FILE HASHES (sha256 of the file on disk)
 -----------------------------------------------
     xauusd_method_LOCKED.py      bfb360af0f850474291f78a5b3c3cca5414a8417065f142985489bec3b710275
     xauusd_method_LOCKED_H4.py   acc7d5beddae99db4044ca26305cb57c815ca62f02b65167fb4bded4450d2271
-    signal_live_h4.py            0a088a509e492120   (prefix; full value inside bundle)
+    signal_live_h4.py            a1c5557c97ad9f6c6a0e827d743737bffd9e5bb92519ce61075f595d30a2b7d7
+
+Recompute these with `sha256sum` after any approved change instead of trusting
+the prefixes recorded here; a stale hash in this file is worse than no hash.
 
 DO NOT confuse these with the INTERNAL LOCK HASH reported by --verify:
     H4 lock : 0c76e240d109d60831e32483447f673a78406a0dc26ff5324df2a6bda62593b4

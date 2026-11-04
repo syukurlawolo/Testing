@@ -74,6 +74,15 @@ Backtest Engine** (win rate / profit factor / max drawdown, pick the best) →
    `scripts/parse_mt4_hst.py`. Parsing is deterministic and needs no GUI
    automation or login.
 
+2a. **A stale `.hst` is a chart-open problem, not a feed problem.** MT4 only
+   writes the history file for the timeframe whose chart is open, so a frozen
+   `XAUUSD240.hst` beside a fresh `XAUUSD60.hst` means nobody had the H4 chart
+   open. Check mtimes across the `.hst` family and grep the profile's `.chr`
+   files for `period=` before blaming the network or shopping for an API. When
+   the user asks for a real-time source instead, read
+   `references/realtime-price-sources.md` — it carries the tested spot/futures
+   endpoint matrix and the measured reason GC=F must never be priced as XAUUSD.
+
 2b. **Read the user's drawn S/R levels from the chart-object file** when they
    ask to backtest "based on my lines". The red horizontal lines live in
    `%APPDATA%\MetaQuotes\Terminal\<hash>\profiles\<profile>\chartNN.chr` — a
@@ -277,6 +286,10 @@ Backtest Engine** (win rate / profit factor / max drawdown, pick the best) →
   parsing `.hst` files (see above). There is no live-tick API and no
   economic-calendar tool — "current price" = last close in the freshest
   `.hst`, and the news check is a best-effort web search, not a real-time feed.
+  For a genuine external quote, gold-api.com and the TradingView scanner both
+  serve spot XAUUSD without a key; Yahoo serves gold **futures** only, and its
+  basis against the broker's spot measured ~$33/oz — never feed it into
+  entries, TP or SL. Details: `references/realtime-price-sources.md`.
 - Check WHICH periods exist first: M5 (`XAUUSD5.hst`) and D1
   (`XAUUSD1440.hst`) are often absent from MT4 history — only M15/M30/H1/H4
   may be present. Do not promise a 5-TF dataset without checking.

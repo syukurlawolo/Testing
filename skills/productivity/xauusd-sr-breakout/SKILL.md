@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.6.0
+version: 1.9.6
 author: Hermes Agent
 license: MIT
 ---
@@ -34,6 +34,23 @@ v1.1.0, so a reinstall would have restored the buggy pre-fix signal engine.
 Discipline: after every approved change, three copies must be hash-identical —
 `trading/xauusd_bundle.py`, `<skill>/assets/xauusd_bundle.py`, and the copy in
 the git repo — and each one must separately pass `--verify` on its own.
+
+**Editing the bundle's `EXPECTED` hashes is a trap in itself: touch every entry whose bytes you
+replace, INCLUDING `signal_state.json`.** The bundle embeds the state file too (it carries
+`sent`, `last_signal_key`, `sent_total`, `tg_offset`), so a state reset followed by a payload
+re-splice leaves `--verify` reporting `signal_state.json: embedded bytes do not match recorded
+hash` and `cmd_restore()` exiting 4 with `REFUSING TO RESTORE`. That refusal is the guard
+working — recompute the recorded hash from the new bytes, do not bypass the check, and keep one
+canonical blank state (`sent: []`, `last_signal_key: null`, `sent_total: 0`) in the bundle so a
+restore on a fresh machine does not inherit this machine's history.
+
+**Sweep for every stray copy before calling the sync done.** This machine accumulates
+duplicates: a plain `glob('**/xauusd_bundle.py')` under the home directory found seven. Old
+ones are not harmless archives — each is a restore point that rebuilds the *buggy* engine
+(the v1.1.0/v1.3.0 pair still carried the broken `.hst` reader and the history-dump
+signal bug). Overwrite them all with the current version and print version + sha256 for
+every path so the user can see one hash repeated. "I updated the three copies you named" is
+not the check; "here are all N paths, all identical" is.
 
 A drift check the user can see, not just a claim: print both sha256 side by side
 and the word IDENTIK/BERBEDA, then run `--verify` from the skill copy. When they
@@ -155,18 +172,126 @@ the locked params and keeps finished AND live orders (each with `state`, `bar`,
   a bar count overstates the remaining window by days. Compute
   `sig_ts + Timedelta(hours=TTL_BARS * 4)` against the newest bar's timestamp.
 - **Stale data invalidates every action line.** When the newest bar is older than
-  ~6h, print the DATA MATI warning above all three blocks and say the actions
+  `MAX_DATA_AGE_H` (5h), print the DATA MATI warning above all three blocks and say the actions
   below cannot be trusted — never let "biarkan posisi" be read as advice on a
-  market that has not been seen for hours.
-- **Test the report against truncated history, not only the live state.** The
-  current market is usually flat, so the "position running" and "pending"
-  branches never render. Re-run `build_positions_report()` with `read_hst`
-  monkey-patched to return `df.iloc[:cut]` for a bar where an order was live;
-  that is the only way to see the two branches actually produce text.
+  market that has not been seen for hours. Use one shared constant, not a second hardcoded
+  threshold: a report that disagrees with the sender's gate is its own defect.
+- **A state-derived counter that starts at 0 reads as "the robot never worked".** Any health
+  line counting from the state file (`N sinyal terkirim`) resets with the state, so right
+  after a reset it announces zero — to the user who is checking because he is suspicious.
+  Keep a lifetime `sent_total` incremented on every successful send and phrase the line by
+  what the number means: `belum ada sinyal terkirim` when there is no history, `N sinyal
+  terkirim sejak <reset date>` when the list has entries. Same rule for `/status` last-bar
+  time: read it from `bars[-1]`, never from a stored checkpoint.
+- **A DATA MATI guard that pre-empts the whole report is correct — do not remove it to test.**
+  Truncated-history tests render the stale branch instead of the branch under test. Shift the
+  clock, not the guard: monkeypatch `sig.datetime` with a subclass whose `now()` returns
+  `cut + 5 minutes` while `read_bars()` is patched to the sliced frame.
+- **Test the report against truncated history, not only the live state.** The current market
+  is usually flat, so the "position running" and "pending" branches never render. Scan the
+  last few hundred bars for a cut point where `live_state()` reports each branch, then re-run
+  the full report at that cut and read the text. Assert on the presence of the new marker and
+  the ABSENCE of the banned one (`"Pasang semua yang ada di bawah" not in txt`) — a report you
+  only eyeballed once will regress the next time it is edited.
 
 The method is flat by design most of the time: silence plus "tidak ada order yang
 perlu dijaga" is the correct output, and telling the user so in one sentence
 prevents him from forcing trades.
+
+### Per-bar briefing — one verdict per H4 close, `--briefing`
+
+He asked for a message after EVERY candle close so a signal can never be missed
+(*"supaya saya tidak ketinggalan momen jika ada signal"*), plus a short "masih
+running" note instead of a full plan while a trade is open. Seven kinds, each with
+its own emoji so the notification itself says which one arrived: `signal` / `closed`
+(TP·SL) / `filled` (limit still waiting) / `running` / `expired` (hangus) / `waiting`
+(nothing happened) / `stale` (data dead).
+
+- **Only `waiting` may be withheld, and only for quiet hours (23:00–07:00 WIB).** He
+  confirmed the split explicitly: a message that asks him to ACT (signal, TP/SL, hangus,
+  data mati) must never be time-gated — the whole point is not missing the moment.
+  Suppressing the empty report is a different decision and he approved it once the
+  trade-off was named: ~2,190 'nothing happened' messages a year trains him to ignore
+  the bot, and the real signal gets ignored with them.
+- **Gate on the BAR, not the clock.** `cmd_briefing()` compares `briefed_bar` to
+  `last_bar` and claims it BEFORE building the message, so a 5-minute schedule still
+  produces exactly one message per H4 close. Claiming after the send is a spam bug in
+  the making: `build_bar_briefing()` calls `save_state()` for its own bookkeeping
+  (which exits were announced) and that save silently overwrites a marker written
+  afterwards. Prove it by running `--briefing` three times in a row and asserting
+  `SENT / already sent / already sent`.
+- **"Born on this bar" must come from `track_orders()`, never from `scan()`.** `scan()`
+  judges newness against `live_state()`, which only knows what is open RIGHT NOW; a
+  signal born on an older bar that already exited is invisible to it, so it kept
+  re-offering a stale BUY as `signal` on bars that had only produced an exit. Match
+  `sig_ts == newest bar` in `track_orders()['rows']` instead — that is the literal
+  question being asked.
+- **Signal wins over exit when both land on the same bar.** The method re-arms on the
+  bar after a close, so a bar can carry an exit AND a fresh breakout. Check for the
+  signal first; the exit is history, the entry is what he must place.
+- **Quote live bid/ask only when the newest bar is current.** On a replayed older bar
+  the EA status file still holds today's price, and printing it next to a two-day-old
+  plan is worse than omitting it — gate on `age_h <= 4.5`.
+- **`scan()` prints progress lines to stdout for the CLI.** Captured into a briefing
+  they get pasted into the Telegram message; wrap the call in
+  `contextlib.redirect_stdout(io.StringIO())` (needs `import io, contextlib` at top
+  level, not a local import).
+- **Prove the branches by replaying forward, not by cutting history in isolation.**
+  Walk cut points in time order with the state carried between them (09:00 → 13:00 →
+  17:00 → next day) and print each verdict; a one-shot truncated frame reports
+  `filled`/`running` for bars that really produced `signal`/`closed` minutes earlier.
+  Monkeypatch a `datetime` subclass returning `cut + 6 minutes` so the freshness gate
+  sees a live clock.
+- **Six daily triggers beat `PT5M` repetition.** The contract is 2 minutes after each
+  H4 close (server 01/05/09/13/17/21 → WIB 06/10/14/18/22/02:02). Six
+  `<CalendarTrigger>` blocks in one XML, `StartBoundary` = next occurrence, and confirm
+  with `schtasks /query /v`: six `Start Time` rows and `Repeat: Disabled`.
+
+### `/report` — the month's signals MUST come from the backtest engine
+
+The user's required format, and the guarantee that makes it trusted:
+
+```
+tanggal | jenis transaksi buy/sell | entry | tp | sl | keterangan exit
+(tp/loss/lagi running/planning)    ← planning row is ALWAYS last
+```
+
+- **Build it from `track_orders()` / the locked engine, never a second calculation.** The whole
+  value of the command is that its numbers equal the backtest baku; a bespoke P/L loop drifts by
+  cents and the user reads that as a defect. Prove it before shipping: print
+  `total / finished / TP / SL / WR / cancelled` from `track_orders()` and assert it matches the
+  reference run (354 order, 348 finished, 204 TP / 144 SL, WR 58,62%, 6 cancelled).
+- **Register it in `cmd_poll` WITH aliases** (`/laporan`, `/rekap`, `/history`, `/riwayat`) and in
+  the `/help` + unknown-command lists — an unregistered command is silently consumed by the
+  advancing `tg_offset`, so the user gets nothing rather than an error.
+- **Default month = the month of the newest BAR, not the PC clock.** Around a month boundary
+  those differ, and the PC-clock version reports an empty month on a day with signals. Accept an
+  explicit month too (`/report 10`, `/report 2026-09`) and answer an unparseable one with the
+  expected forms instead of the current month.
+- **Two lines per signal, not one.** Telegram on a phone cannot show a 6-column row; split
+  `tanggal + BUY/SELL + exit status` onto line 1 and `entry / tp / sl` as `<code>` on line 2.
+  Only the numbers get `<code>`, same tap-to-copy rule as the signal message.
+- **Close with the planning block and a WR line that carries its sample size.** A 2-trade month
+  reading "WR 50%" is noise; say so in the same breath, or the number gets traded on.
+
+### "Kenapa candle ini tidak muncul di list?" — check the premise against the bar, then explain
+
+The most common false alarm, and the answer is usually arithmetic rather than a bug:
+
+1. **Read the actual O/H/L/C of the two bars around the one he names** — never argue from his
+   quoted close. He rounds (4026 vs 4027,04), and a few cents on the wrong side of a level flips
+   the whole verdict.
+2. **Test the breakout inequality explicitly for both directions** and print it, e.g.
+   `up: prev <= L < close` and `down: prev >= L > close`. A close that is merely *above* a level
+   is not a downward breakout. Price hovering above a line for hours is not "almost broke it".
+3. **A bar with `open == high == low == close` is not a finished candle.** Seed-time flattening is
+   the tell, and the bar may move for hours yet. Say it is still forming, so a signal cannot
+   legitimately exist for it, and name the clock time it closes (server → WIB).
+4. **Name the price that would have been needed** (`tutup di bawah 4023,16` / `di atas 4062,25`)
+   and the distance from the current close, so the answer is actionable rather than a correction.
+5. **Never let a report imply completeness it does not have.** If a list omits the forming bar,
+   say so in the report itself; letting him infer a missing signal from an artifact is what
+   escalates a correct output into a suspected bug.
 
 ### `cmd_poll` must answer EVERY command in the batch, and never stay silent
 
@@ -217,14 +342,31 @@ manual edit a corruption risk. Regenerate, then re-run all four subcommands.
 almost always the rebuild script is gone while the bundle is not. Do not stop there
 and do not rewrite the bundle by hand: patch the embedded entry programmatically.
 The bundle is plain Python holding `{name: sha256}` in an `EXPECTED` dict plus a
-`{name: ("<base64 chunk>", ...)}` payload block per file, so the edit is exactly
-four steps — (a) hash the changed file, (b) replace its hash line in `EXPECTED`,
-(c) regex out its payload block (`"<name>": \(\n(?:        "[^"]*"\n)+\)`) and
-substitute a freshly wrapped base64 block at 76 chars per line, (d) bump
-`BUNDLE_VERSION`. Then prove it: `--verify` must report every file matching, and
-the same new hash must appear in all three copies (`trading/`, skill `assets/`,
-git repo). `--verify` OK is the proof the payload decodes and matches — a hand
-typed bundle that fails it is the only real corruption risk.
+`{name: ("<base64 chunk>", ...)}` payload block per file. There is **no `--rebuild`
+subcommand** — the CLI is only `--verify`/`--restore`/`--list`/`--diff` — so call
+`cmd_restore()` from an imported module when you need to test, and edit the file
+directly when you need to rebuild. Four steps, in this order:
+
+  1. **Find the block by index, not by regex.** `i = src.index('"<name>": (')` then
+     `j = src.index('\n    ),', i) + len('\n    ),')` and splice `src[:i] + new + src[j:]`.
+     A `re.sub` with `"<name>": \(\n(?:        "[^"]*"\n)+\)` backtracks for minutes on a
+     ~185 KB bundle and the call can time out — and if it times out *before* the write,
+     the file is left untouched, so verify the size/hash before assuming corruption.
+  2. Replace the file's hash in `EXPECTED` (single `str.replace(..., 1)`, hash the
+     **bytes** of the changed file).
+  3. Emit the payload at **74 chars per line**, not 76 — match the existing wrapping so
+     the diff stays one block and the decoded bytes stay identical.
+  4. Bump `BUNDLE_VERSION`.
+
+Then prove it three ways, because each catches a different failure: `--verify` must
+report every file matching (the payload decodes), a restore into an **empty** scratch
+folder must write all 11 files, and a `/status` run **from the restored copy** must show
+the new behaviour — that last one is the only proof the change is actually inside the
+bundle rather than only in `trading/`. Delete the test folder and any `.bak` afterwards.
+
+`cmd_restore()` writes into the module-level `TARGET_DIR`, which is a **`pathlib.Path`**.
+Overriding it in a test needs `Path(r"C:/...")`; assigning a plain `str` raises
+`AttributeError: 'str' object has no attribute 'mkdir'`.
 
 ### Distinguish file hash from lock hash in every report
 
@@ -253,13 +395,15 @@ Lessons learned the hard way — do not re-break these:
   additionally ask `live_state()` for a `pending`/`open` signal and append it to
   `new` before sending. Verified by writing a synthetic `.hst` with one extra
   breakout bar: before the fix 0 new signals, after it 1 (BUY 3934.48).
-- **Scheduled-task `<Duration>P1D</Duration>` silently kills the whole robot.**
-  `schtasks /Create /SC DAILY /RI 240 /DU 24:00` writes a repetition window of
-  one day; after midnight the task simply never fires again and still reports
-  success. Always register from XML with **no `<Duration>` element** and confirm
-  with `schtasks /Query /TN <name> /XML`. PowerShell's `$task.NextRunTime` can
-  read EMPTY while `schtasks /Query /FO LIST` shows a valid time — trust
-  `schtasks`, not the PowerShell object.
+- **Scheduled-task repetition needs `<Duration>P1D</Duration>`, not its absence.**
+  A `CalendarTrigger` with `<Interval>PT5M</Interval>` and no `<Duration>` repeats
+  **zero times**: Windows reads the window as PT0S, so the task fires on the start
+  boundary and never again, while still reporting `Status: Ready`, `Last Result: 0`
+  and a `Next Run Time` that keeps advancing. Keep the two cases apart — omitting
+  `<Duration>` is the bug, `PT5M`-with-`P1D` is the fix; a repetition window that
+  expires (`/DU 24:00` on a daily task) is a *different* defect with the same
+  symptom. Diagnose on `Last Run Time` + new log files, never on `Next Run Time` or
+  `Status`. Details: **Task Scheduler: repetition needs `<Duration>`** below.
 - **Do not set `Repetition.Duration = ''` via PowerShell.** It corrupts the
   trigger (NextRun becomes empty and the task stops firing). Re-create the task
   from XML instead.
@@ -267,6 +411,26 @@ Lessons learned the hard way — do not re-break these:
   yet is invisible to it, yet that is exactly what a trader is holding. Use
   `live_state()` in the bot to walk the bars with the locked params and report
   `pending` / `open` / `flat`. Verified 346/346 against the engine.
+- **A repeating signal is a KEY defect before it is a schedule defect.** Three bugs stack into
+  the same symptom — the same signal every tick: state loaded as `dict` where code calls
+  `.append()` (raises *after* the send, so nothing is saved), state saved *after* sending instead
+  of before, and the live signal's key built inline instead of by the same `sig_key()` helper
+  that wrote the stored key. Fix all three or the spam returns: normalise on load, claim
+  (append + `save_state`) before the send call, and derive both keys from one function. Python
+  how-to and the proof sequence: `references/live-deployment.md` → "Keeping the bot honest
+  about signal freshness".
+- **Check WHICH file the robot read before believing anything it says.** `FEED_MAX_AGE_MIN` is a
+  source-selection limit, not a freshness gate; set too tight it silently falls back to `.hst`,
+  which can be days older, and the engine then announces old bars as live signals. Keep a
+  separate `MAX_DATA_AGE_H` gate that makes the sender return without sending, and make
+  `/status` use the same constant. Every run must print the filename, bar count, last bar and
+  its age.
+- **A crash AFTER a successful send still counts as a broken robot.** `SENT: ...` in the log plus a
+  traceback on the following line means the message arrived and the process died — the next
+  `getUpdates` batch then never runs and `/status` stays silent while every signal that day still
+  looks delivered. The shape to expect is a state file loading a `dict` where the code calls
+  `.append()` (`AttributeError: 'dict' object has no attribute 'append'`). Never sign off on "the
+  message arrived": re-run the batch and grep the log for a traceback after each `SENT:`.
 - **Telegram `getUpdates` must be called WITH the stored offset.** Without it
   Telegram re-serves the same update forever and `/status` gets answered on
   every poll. Store `tg_offset` after each batch.
@@ -305,11 +469,36 @@ Lessons learned the hard way — do not re-break these:
 This user tunes `/status` by telling you to "make the words easier". The shape that works:
 
 1. **One verdict line with a traffic light**, then nothing else until the action.
-   🔴 `DATA MATI — jangan trading` (data older than ~6h) · 🟡 `ADA ORDER BELUM TERISI`
+   🔴 `DATA MATI — jangan trading` (data older than `MAX_DATA_AGE_H`, 5h) · 🟡 `ADA ORDER BELUM TERISI`
    · 🟢 `POSISI SEDANG BERJALAN` · ⚪ `TIDAK ADA YANG PERLU DIPASANG`.
-2. **The order to place, in imperative.** `Pasang BUY STOP/LIMIT di:` then the entry
-   alone on its line as `<code>`, then `TP … SL …` on one line, then `Sisa waktu: N jam`.
-   These are the only copyable values — same `<code>`-only rule as the signal message.
+2. **The order to place, in imperative — and ONLY if one actually exists.**
+   The verdict line and the order block must both come from `live_state()`, never from
+   a two-way scenario preview. `pending` → `Pasang BUY LIMIT di:` then the entry
+   alone on its line as `<code>`, then `SL` / `TP` each on their own `<code>` line, then
+   `Sisa waktu: N jam`. `open` → the same numbers framed as already filled
+   (`biarkan berjalan sampai TP atau SL`, no expiry). `flat` → say
+   **`⚪ TIDAK ADA YANG PERLU DIPASANG`** and stop; what to wait for goes below the
+   divider. These are the only copyable values — same `<code>`-only rule as the signal message.
+
+- **Never render a "place these now" block outside a `pending` state.** A `/status` that
+  prints both directions with an imperative (`Pasang semua yang ada di bawah, dua arah
+  sekaligus — SELL x / BUY y`) while the method is flat is the worst defect this robot can
+  ship: it is read at the exact second the user is deciding whether to place an order, and
+  it instructs action the locked method forbids. Two-way hedge is a *measured variant*, not
+  this method — never surface it as a plan. The bot's whole job on a flat market is the
+  word **nothing**, plus the level being watched.
+- **Price labels must say what they are.** The newest bar's `close` is not the live price;
+  label it `Close lilin H4 terakhir` and add one line saying so. A live bid/ask line comes from
+  the EA status file and sits ABOVE it, labelled `Harga sekarang`, with the delta to the close
+  (`+7.15 dari close lilin 4027.04`) on the next line — that single number is what tells him
+  whether the market has moved away from the bar the method is reading. When the status file is
+  older than ~5 minutes, print `Harga terakhir tercatat ... (EA diam N jam)` instead of a live
+  price: showing a frozen bid as "sekarang" is the same lie as a stale signal. The live line is
+  display-only and must never enter `live_state()`, `scan()` or any entry/TP/SL arithmetic.
+- **A feature the user can see missing, he will ask for — wire it in rather than explaining why not.**
+  The moment `/status` was restored he asked whether it returns "harga terbaru"; the answer took
+  ten minutes because the EA status file already held `bid`/`ask`/`spread`/`server_time`/
+  `terminal_connected`. Read that file before proposing new plumbing.
 3. **What is being waited for, in conditional language.** `BUY kalau tutup di atas X` /
    `SELL kalau tutup di bawah Y` — the level, not the technical term "resistance".
 4. **`➖➖➖ rincian ➖➖➖`, then everything else.** Last candle time, nearest levels with
@@ -437,9 +626,16 @@ common** with the locked method. Every figure previously quoted from it — incl
   clone-based verification that must pass before calling a push done. For a repo
   meant to survive an amnesiac Hermes, also read `references/repo-sync-to-git.md`.
 - Any request to quote this strategy's win rate, Profit Factor, or drawdown.
+- Re-running the backtest on a newer export the user supplies. Follow
+  **Re-running the backtest on newer user data** — control run, bar validation, and the
+  diff-against-old-output proof that the method did not drift.
+- Any question about a candle's clock time, or a signal that looked "late". MT4 CSV stamps are
+  bar-open in the broker's server zone (see the timestamp rule in that same section).
 - Building, scheduling, or debugging the Telegram signal robot. Read
   `references/live-deployment.md` first — it carries the `.hst` decoder, the Windows
   Task Scheduler failure modes, and the signal-freshness rules.
+- Drawing a chart, candle diagram, or step-by-step animation of the method. Start from
+  `templates/cycle-animation.html` and follow **Visualising is a first-class answer here**.
 
 ## Explaining the method to the user
 
@@ -451,6 +647,13 @@ step-by-step story of what the robot does, not a code walkthrough and not a para
   test → the order it places → the expiry → TP → SL → one-position rule → the tie-break.
 - Quote the tiny code fragment only *after* the sentence it explains (`prev_close <= L < close`),
   as proof the words match the file. Never lead with code.
+- **That code fragment is proof, never explanation.** Handing him `prev_close <= level < close`
+  gets a flat *"saya tidak mengerti"* — the comparison operators are unreadable to him. Replace
+  it with two concrete closes and the level named as a "garis pantau": *"lilin tadi tutup di
+  3.928 (masih di bawah garis 3.931,48). lilin kedua tutup di 3.937 (sudah di atas garis itu).
+  harga baru saja naik melewati garis."* Same fact, no symbols, and the verdict ends the sentence
+  instead of a formula doing the work. State up front that the bot ignores high and low — it looks
+  at **only the closing price** — because that is the assumption he is quietly getting wrong.
 - Draw the arithmetic out as a worked example with real numbers from the level list
   (level 3341.15 → buy limit 3344.15 → next level 3402.33 → $58.18 capped to $30 → TP 3374.15,
   SL 3326.15). Abstract descriptions do not land; a concrete ticket does.
@@ -469,6 +672,37 @@ step-by-step story of what the robot does, not a code walkthrough and not a para
   "place it when the notification arrives, ~30s" or "build the MT4 EA that places it for you".
 - Close with a one-paragraph summary in plain speech — that is the version he will re-read.
 
+**Visualising is a first-class answer here, not decoration.** "Bisa kamu visualisasikan?" / "buatkan
+animasi siklusnya" are requests for a CHART built from real bars, and the shape he reacts well to
+is a `::preview{file=...}` HTML widget with inline SVG — no chart library, no CDN. Geometry that
+works for a 430px-wide frame: precompute `ymin`/`ymax` from the candles **plus every horizontal
+line** (TP, SL, entry, levels) so no line falls outside the plot; scale with
+`Y = PADT + ih - (v-ymin)/(ymax-ymin)*ih`; put price labels in a right-hand gutter ~62–70px wide;
+draw TP `#16a34a`, SL `#dc2626`, entry `#3b82f6` dashed, levels `#a855f7` dotted, candles green/red
+by `close >= open`. Always verify with a DOM query — `getBBox()`, `nRects`/`nLines`, and
+`rects.filter(r => r.x<0 || r.y<0 || r.x+r.w>W || r.y+r.h>H).length === 0` — the frame sizes
+itself from the content and a clipped or off-canvas line is invisible to you without a vision pass.
+
+- **A staged animation beats a static chart for the cycle question.** Seven stages on one chart —
+  *diam → lilin tutup melewati garis → pasang order → order kena → menunggu exit → SL/TP → jeda 1
+  lilin* — where each stage draws one more candle plus the bands that only exist from that stage
+  onward. Give prev/next buttons AND a numbered tab per stage AND an autoplay timer, so he can
+  either watch it or jump to the stage he is unsure about; the stage caption goes under the chart
+  and is the only sentence that has to be read.
+- **Shade the profit and loss zones.** Two translucent rectangles from entry to TP (green) and
+  entry to SL (red) make the $30-vs-$18 asymmetry visible at a glance — that is the answer to
+  "kenapa win rate cuma 58% tapi untung", and it lands without a sentence about expectancy.
+- **Plot a losing trade, not a winning one**, when the live context is a trade he is asking about.
+  A loss shows the near-miss (TP 3.964,48 against a high of 3.964,29 — 19 cents short) and the SL
+  being hit, which a green example hides. It also gives him the honest read on the signal he is
+  holding rather than a flattering one.
+- **All bars come from his own CSV, never synthesized.** Say so in the message — "semua candle di
+  animasi ini data asli, bukan contoh buatan" — because he has already caught a synthetic example
+  being presented ambiguously once.
+- Working scaffold to copy instead of re-deriving the SVG maths: **`templates/cycle-animation.html`**
+  — a self-contained 7-stage widget with the right-arrow buttons, per-stage tabs, autoplay, and the
+  TP/SL shading bands already laid out. Substitute the `__DATA__` JSON block with real bars and ship.
+
 **Rule hypotheticals ("level A broken, then level B in the same candle — then what?").** His
 questions often describe two things the engine cannot do at once. Check the engine first, then
 run a ~25-line synthetic-bar simulation and show the printed trace, then name the false premise.
@@ -477,9 +711,33 @@ touch, and resolves a bar that hits both SL and TP as SL. Worked example, the pr
 the scenario is near-impossible on real data, and the answering shape are in
 `references/rule-questions-and-simulations.md`.
 
+**When he names a different trading STYLE rather than a hypothetical** ("coba backtest gaya
+buy/sell stop dua arah, yang kena duluan jalan"): that is a request to MEASURE a rival method,
+not to change this one. Never edit a locked file to answer it. Read `run()` and copy its
+exit/fill/cooldown semantics into a scratch simulator verbatim, then **prove the simulator by
+reproducing the locked trade count, WR, PF, net and maxDD first** — until it matches, every
+number after it is unattributable. Implement the variants as separate named modes (one-slot /
+OCO-cancel-loser / loser-stays-live-with-`FLIP`), sweep several start dates instead of one, and
+close by proving both `*_LOCKED*.py` hashes are IDENTIK and that nothing was written to disk.
+Full recipe, including how to phrase "more net but proportionally more drawdown = bigger size,
+not a better method": `references/rule-questions-and-simulations.md`. That file also carries the
+**template-CSV contract** (`Pair;Action;Tanggal Entry;Tanggal Exit;Entry;TP;SL;Keterangan`) and the
+**hedge-mode audit** — when both stops stay live, the per-row PnL in the file is not withdrawable
+money, and saying so belongs in the same reply as the win rate.
+
 Do not slip into restating the mechanics as a feature list, and do not soften the honest
 caveats: the high win rate comes from the 0.6 RR (win $30 / lose $18), not from superior
 prediction. Say that in the same breath as the WR figure.
+
+**"Jelaskan kronologinya — dari dia pasang sinyal sampai buka sinyal baru" is a request for the
+CYCLE, not the parameter table.** Walk the three states in execution order — `diam` (waiting for a
+breakout) → `pending` (order placed at the breakout bar's close) → `posisi` (filled) → back to
+`diam` — and answer the expiry question explicitly, because he always asks it next: a pending lives
+**2 H4 bars = 8 hours** then is auto-cancelled, while a FILLED position has **no expiry at all** and
+only ends at TP or SL. Give measured numbers, not the rule alone: ~98% of pendings fill before
+expiry (so the TTL is real but rarely used), median holding 1 bar, 79% of trades finish in one bar,
+longest 72h, and a 1-bar cooldown before planning resumes. Close with the comparison table against
+whatever variant he was last asking about.
 
 Strategy is **frozen at v1.0.1**. Parameters are byte-identical to v1.0.0 (the user chose cap $30
 again explicitly). Only the `backtest_reference` block was corrected. Never tune parameters
@@ -741,6 +999,22 @@ fractal k=5, cluster tol $8, min dist $30, fit on TRAIN only (`strategy_SWING.js
 edge is thin (~$0.77/trade gross, negative after $1/oz) and one level carried most of the net.
 - The CSV must be refreshed from MT4 before scanning. A stale CSV produces no signals rather
 than wrong ones, but it will also never fire.
+- **A frozen `.hst` is a flush problem, not a dead feed — and it is NOT proof the chart is
+  closed either.** MT4 keeps live bars in memory and writes history to disk on close, on
+  symbol/timeframe reload, or when it pulls older history, so a terminal showing a moving price
+  can leave every `.hst` untouched for hours. The tell is that the WHOLE family is frozen at
+  the same minute (H1/H4/M15/M5/M1), not just one timeframe. `tasklist /V` shows
+  `<account>: <Server> - [<SYMBOL>,<TF>]` in the window title — that single line proves login
+  and which chart is open, so read it FIRST; inferring chart/timeframe from profile `.chr`
+  files or a missing login line in the terminal log produced two wrong diagnoses in one session.
+  A `.hst` freeze is not enough on its own to conclude anything — verify with the window title
+  and the user before also proposing a new data provider or a VPS. When the user does
+  want an outside quote, spot XAUUSD is available keyless from `api.gold-api.com/price/XAU` and
+  the TradingView scanner (`OANDA:XAUUSD`); Yahoo only offers gold **futures** (`GC=F`, needs a
+  `User-Agent` header) whose basis against the broker's spot measured **~$33/oz** — never feed it
+  into entries, TP or SL. Use an outside quote as an alarm that MT4 is behind, never as the
+  price source. Details: `references/realtime-price-sources.md` in the `trading-backtesting`
+  skill (load it with skill_view before advising on providers).
 - When a bar hits both TP and SL, this engine resolves it as **SL**. Pin every exit ambiguity
 the same way rather than leaving it implicit — see the ambiguity table in
 `references/backtest-reproducibility.md`.
@@ -755,12 +1029,17 @@ the same way rather than leaving it implicit — see the ambiguity table in
   protection and is really silent data loss: any multi-bar gap (laptop asleep, MT4 closed)
   truncates the newest real signal out of the state, and it never gets announced. Bound by
   freshness (drop signals older than a few bars) instead of by count.
-- **`Last Run Time` drifting hours behind the `PT5M` schedule means the laptop is asleep or
-  locked, not that the robot is broken.** A managed machine that locks on idle stops firing
-  scheduled tasks without writing any error; `schtasks /Run` succeeding instantly while the
-  trigger does nothing proves the code is fine and the host is the fault. Report it as the host
-  failing and name the three things that must stay alive (machine awake, MT4 logged in, network)
-  — never restate it as "Hermes must be running". Hermes is not in the runtime path.
+- **`Last Run Time` drifting hours behind the `PT5M` schedule is a DEFECT until you have
+  read the task XML — do not open with "the laptop is asleep".** A locked or sleeping host
+  is only one candidate: a `<Repetition>` without `<Duration>` produces the identical
+  signature (one run on the start boundary, nothing after it, `Next Run` still advancing),
+  and it keeps firing-behaviour broken on a machine the user is watching. The user will
+  correct you — they can see the laptop is on and MT4 is live. Read
+  `schtasks /Query /TN <name> /XML` and `getUpdates` **first**, name the cause, and only
+  then propose a remedy; sleeping-host and dead-trigger have different fixes and a
+  wrongly-named cause sends the user chasing the wrong thing. If it really is the host,
+  name the three things that must stay alive (machine awake, MT4 logged in, network) and
+  never restate it as "Hermes must be running" — Hermes is not in the runtime path.
 - **A scheduled Windows task can report `Last Result: 0` and still never have run.** Never
   accept the scheduler's status as proof; delete the logs, trigger the task, and confirm a
   non-empty log file appeared. `DisallowStartIfOnBatteries` (default on for `schtasks /Create`)
@@ -792,9 +1071,82 @@ A `CalendarTrigger` with `<Repetition><Interval>PT5M</Interval></Repetition>` an
 - Diagnose with `Last Run Time`, never `Next Run Time`: if `Last Run` is hours old while the machine was on and logged in, the repetition is dead.
 - Then prove it: count files in `trading/logs/run_*.log`, wait past two trigger boundaries, and confirm the count rises twice with no manual run.
 
+## Re-running the backtest on newer user data — freeze the method, only swap the data
+
+When the user asks to "backtest lagi dengan data terbaru", the method stays locked; only the
+input changes. Sequence:
+
+1. Locate their newest export (they usually name a file in `~/Downloads/`), then **print the
+   first and last row and count the bars** before running anything. Confirm the last timestamp
+   is actually newer than the dataset the locked figures came from — otherwise the run proves
+   nothing and the honest answer is "data ini lebih pendek".
+2. **Validate the bars** before trusting the result: no `high < max(open, close)`, no
+   `low > min(open, close)`, no duplicate timestamps, and list gaps > 4h (weekends are
+   expected). A price-mangled export passes a row count and fails on this.
+3. Control run first: both `--verify` on the untouched locked files. If a verifier fails, stop
+   — the drift is the finding.
+4. Run the locked file with `--csv <new> --out <new_out>`. Never edit the method, never write
+   the new output over a reference CSV.
+5. **Diff against a control run on the OLD dataset** (`--csv <old> --out tmp_old.csv`, then
+   `diff`). The expected shape is: every old row identical byte-for-byte, plus N appended rows.
+   Say that explicitly — "347 vs 346 trade, 346 baris pertama identik, satu baris tambahan" —
+   because this user treats any drift in the shared prefix as a defect in you.
+6. Report delta only: trade count, WR, PF, net, maxDD, and each new trade's full line
+   (entry / TP / SL / result). Attribute it: if the new trade is the order you had already
+   issued in `/status`, say so — that is what makes the report useful rather than a table.
+7. **A short window asks for a warm-up prefix, not a hard cut.** The engine needs `prev_close`
+   and prior position state, so slicing the frame at the start date deletes or flips the lane
+trade. Feed history from well before the window, then filter the RESULT rows by
+   `entry_time >= window_start` before computing stats, and say in the reply that the warm-up
+   was done and why.
+8. **When the user says a signal he received already hit TP but the run says SL, do not argue
+   from memory or from the CSV alone — reconcile the three artefacts.** (a) The bot's own log
+   (`trading/logs/run_*.log`): the `SENT:` line's timestamp is when the message left, which is
+   frequently a DIFFERENT day than the bar it describes, because the task was down and later
+   replayed history — quote the log line so "kapan sinyal dikirim" is settled. (b) The bar trace
+   after the fill: check whether the `high` between fill and exit actually reaches TP, including
+   the near-miss case (TP 3964.48 vs high 3964.29). (c) His MT4 history screenshot. A signal
+   message states a PLAN, not a confirmed TP — no message is sent on TP, so "sudah TP" on his
+   side may be a manual close or a different fill bar. Ask for the screenshot instead of
+   insisting the data is right.
+
+Do not "improve" the method because the new data disappointed; that needs a new strategy id
+and explicit approval (`Changing the strategy`, bottom of this file).
+
+### MT4 CSV timestamps are bar-OPEN time in the BROKER's server zone — not WIB, not bar-close
+
+This shifts every **label** the robot prints and the apparent fill timing, without changing the
+backtest arithmetic (all bars move together, so the rule is consistent). Prove the convention
+before quoting any candle time, with this fingerprint: the `open` of bar *i* equals the `close`
+of bar *i−1* of the same session — so a bar stamped `13:00` whose open matches the `09:00` bar's
+close is a bar whose label is *open time*, and its candles span 13:00→17:00 server.
+
+Consequences to state plainly when they come up:
+
+- **A breakout bar can already contain the fill.** If `high ≥ entry` on the breakout bar itself,
+  the `level ± $3` limit was touchable in the very candle that confirmed the signal. The bot
+  announces one bar later, so the user's real fill is worse (or missed) than the reported entry.
+  This is an execution-time honesty point, not a backtest bug — the engine's "enter from the next
+  bar" convention is uniform across all trades.
+- **Translate to WIB in human-facing text** (server zone is typically GMT+2/+3; WIB is GMT+7), and
+  say "candle 13:00 server = 17:00 WIB" rather than letting a server stamp read as local time.
+  Golden rule: never present a server timestamp as if it were the user's clock.
+- **Still open as of this writing:** whether the loader should shift stamps to a fixed local zone.
+  It is a change to the core file, so it needs explicit approval; until then report the label
+  offset as a known limitation in the same message as the backtest table.
+
 ## Reporting style for this user
 
 - Give the verdict first, then the table, then what is still blocked. Indonesian.
+- **When this user says "kerjakan sendiri, akses saja X-ku", he means it — and when a tool
+  genuinely cannot do the GUI step, say so and hand back a numbered manual list in ONE reply.**
+  Driving a desktop app, compiling MQL4, and clicking through MT4 menus are things a hosted
+  tool may not be able to complete; the failure to avoid is trying for many turns and then
+  still leaving him with prose instead of steps. Name the blocker in one line (what you tried,
+  what it returned), then give the exact clicks: F4 → dbl-click the file → F7 → look for
+  `0 errors, 0 warnings` → drag from Navigator → OK → where to look for the output file. Each
+  numbered step ends in something he can verify himself, and the reply closes with "bilang
+  kalau sudah" so verification happens next turn on real evidence.
 - When asked to publish, mirror, or bundle the system, ship **everything**: both
   locked methods, the bundle, every runner `.bat`, both docs, the skill, and the
   reference data needed to reproduce `--verify`. "Tanpa terkecuali" is literal —
@@ -813,6 +1165,12 @@ A `CalendarTrigger` with `<Repetition><Interval>PT5M</Interval></Repetition>` an
 - State a number only when you reproduced it. If a claim failed to reproduce, say so at the
   top of the reply, not buried at the end — this user actively checks for results that drift
   between runs and treats a quiet change as a defect.
+- **"ditemplate backtesting seperti biasa" is a request for a deliverable FILE, and it is not
+  the same request as "jangan disimpan".** Simulation-only means do not touch `trading/`, the
+  locked files or the bundle; it never means withhold the CSV. When he asks for the template, ship
+  the file in his exact format (see the contract in
+  `references/rule-questions-and-simulations.md`), re-read it from disk, and report the counts
+  from the written file — not from the in-memory run.
 - Do not present a reconstructed engine's output as confirmation of an older claim. Say
   plainly which figures are reproduced and which are merely recorded.
 

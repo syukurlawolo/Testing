@@ -1,0 +1,127 @@
+# Reusable candle-simulation widget for the xauusd-sr-breakout skill.
+#
+# Copy this file, replace the DATA JSON block with real bars from the user's CSV,
+# write it to the scratch dir, then embed in chat with a lone line:
+#     ::preview{file="C:/Users/.../scratch/<name>.html"}
+#
+# DATA shape:
+#   { candles: [{ts, o, h, l, c}, ...],          <- REAL bars, never synthesized
+#     levels:  [3868.45, 3931.48, 3988.70, ...], <- level grid, drawn dotted purple
+#     trade:   {level, entry, tp, sl, tp_level} }
+#
+# Theme vars (var(--foreground), --muted-foreground, --border, --accent) are injected
+# by the Hermes preview frame. Do NOT set a page background, font, or margins.
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+  body { margin:0; padding:0; background:transparent; font-family:inherit; color:var(--foreground); }
+  * { box-sizing:border-box; }
+  .wrap { width:430px; }
+  .hdr { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  #stTitle { font-size:13px; font-weight:700; letter-spacing:.3px; }
+  #stDesc { font-size:11.5px; line-height:1.55; color:var(--muted-foreground); min-height:36px; margin:4px 0 8px; }
+  .ctrls { display:flex; gap:6px; align-items:center; margin-top:8px; }
+  button { font-family:inherit; font-size:11px; padding:5px 12px; border-radius:6px;
+           border:1px solid var(--border); background:transparent; color:var(--foreground); cursor:pointer; }
+  button:hover { background:var(--accent); }
+  .track { height:3px; background:var(--border); border-radius:2px; margin-top:8px; overflow:hidden; }
+  #bar { height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .tabs { display:flex; gap:2px; }
+</style></head>
+<body><div class="wrap">
+  <div class="hdr">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted-foreground);">STAGE LABEL HERE</div>
+    <div class="tabs"></div>
+  </div>
+  <svg id="chart" width="430" height="260" style="display:block;"></svg>
+  <div class="track"><div id="bar"></div></div>
+  <div id="stTitle"></div>
+  <div id="stDesc"></div>
+  <div class="ctrls">
+    <button id="prev">&#8592; Sebelumnya</button>
+    <button id="next">Berikutnya &#8594;</button>
+    <button id="play">&#9654; Putar otomatis</button>
+  </div>
+</div>
+<script>
+const D = __DATA__;
+const CAND = D.candles, T = D.trade, LV = D.levels;
+const COL = { entry:'#3b82f6', tp:'#16a34a', sl:'#dc2626', level:'#a855f7', up:'#16a34a', down:'#dc2626' };
+
+const W = 430, H = 260, PADL = 6, PADR = 70, PADT = 16, PADB = 26;
+const iw = W - PADL - PADR, ih = H - PADT - PADB;
+// ymax must include every horizontal line or one falls outside the plot
+const allV = [...CAND.flatMap(c => [c.h, c.l]), T.entry, T.tp, T.sl, ...LV];
+const lo = Math.min(...allV), hi = Math.max(...allV), padV = (hi - lo) * 0.06;
+const ymin = lo - padV, ymax = hi + padV;
+const Y = v => PADT + ih - ((v - ymin) / (ymax - ymin)) * ih;
+const bw = iw / CAND.length;
+
+// One entry per stage. How many candles are lit, which overlays exist.
+const STAGES = [
+  { t:'1 · DIAM',            d:'Bot diam, cuma memperhatikan harga tutup tiap 4 jam.', n:1, order:0 },
+  { t:'2 · LILIN TUTUP',     d:'Lilin tutup melewati garis.', n:2, order:0 },
+  { t:'3 · PASANG ORDER',    d:'Entry / TP / SL dipasang.', n:3, order:1 },
+  { t:'4 · ORDER KENA',      d:'Harga menyentuh entry, posisi terbuka.', n:3, order:1 },
+  { t:'5 · MENUNGGU EXIT',   d:'Posisi terbuka, tidak ada order baru.', n:4, order:1 },
+  { t:'6 · EXIT',            d:'SL atau TP kena.', n:6, order:1 },
+  { t:'7 · JEDA 1 LILIN',    d:'Posisi tutup, bot istirahat 4 jam.', n:6, order:1 },
+];
+
+function draw(stage) {
+  const S = STAGES[stage];
+  let s = '';
+  for (let k = 0; k <= 4; k++) {
+    const v = ymin + (ymax - ymin) * k / 4, y = Y(v);
+    s += `<line x1="${PADL}" y1="${y}" x2="${PADL+iw}" y2="${y}" stroke="var(--border)" stroke-width="0.5" opacity=".55"/>`;
+    s += `<text x="${W-PADR+4}" y="${y+3.5}" font-size="9" fill="var(--muted-foreground)">${v.toFixed(0)}</text>`;
+  }
+  LV.forEach(L => {
+    if (L < ymin || L > ymax) return;
+    const key = Math.abs(L - T.level) < 0.01;
+    s += `<line x1="${PADL}" y1="${Y(L)}" x2="${PADL+iw}" y2="${Y(L)}" stroke="${COL.level}" stroke-width="${key?1.4:0.8}" stroke-dasharray="4 3" opacity="${key?0.9:0.4}"/>`;
+  });
+  // profit / loss zones make the RR asymmetry visible
+  if (S.order) {
+    s += `<rect x="${PADL}" y="${Y(T.tp)}" width="${iw}" height="${Y(T.entry)-Y(T.tp)}" fill="${COL.tp}" opacity=".10"/>`;
+    s += `<rect x="${PADL}" y="${Y(T.entry)}" width="${iw}" height="${Y(T.sl)-Y(T.entry)}" fill="${COL.sl}" opacity=".10"/>`;
+  }
+  const hl = (v, col, lab, dash) =>
+    `<line x1="${PADL}" y1="${Y(v)}" x2="${PADL+iw}" y2="${Y(v)}" stroke="${col}" stroke-width="1.6" ${dash?'stroke-dasharray="6 4"':''}/>` +
+    `<text x="${W-PADR+4}" y="${Y(v)+3.5}" font-size="9" font-weight="700" fill="${col}">${lab}</text>`;
+  if (S.order) { s += hl(T.tp, COL.tp, 'TP ' + T.tp, 0); s += hl(T.sl, COL.sl, 'SL ' + T.sl, 0); s += hl(T.entry, COL.entry, 'ENTRY ' + T.entry, 1); }
+
+  CAND.forEach((c, i) => {
+    const x = PADL + i*bw + bw/2, up = c.c >= c.o, col = up ? COL.up : COL.down;
+    const yTop = Y(Math.max(c.o, c.c)), yBot = Y(Math.min(c.o, c.c));
+    s += `<g opacity="${i < S.n ? 1 : 0.13}">`
+       + `<line x1="${x}" y1="${Y(c.h)}" x2="${x}" y2="${Y(c.l)}" stroke="${col}" stroke-width="1.3"/>`
+       + `<rect x="${x-bw*0.3}" y="${yTop}" width="${bw*0.6}" height="${Math.max(yBot-yTop,1.5)}" fill="${col}" opacity=".92"/>`
+       + `</g>`;
+  });
+
+  document.getElementById('chart').innerHTML = s;
+  document.getElementById('stTitle').textContent = S.t;
+  document.getElementById('stDesc').textContent = S.d;
+  document.getElementById('bar').style.width = ((stage+1)/STAGES.length*100) + '%';
+  document.querySelectorAll('[data-st]').forEach(el => {
+    const on = +el.dataset.st === stage;
+    el.style.background = on ? 'var(--accent)' : 'transparent';
+    el.style.color = on ? 'var(--foreground)' : 'var(--muted-foreground)';
+    el.style.fontWeight = on ? '700' : '400';
+  });
+}
+
+let cur = 0;
+const go = n => { cur = Math.max(0, Math.min(STAGES.length-1, n)); draw(cur); };
+document.querySelector('.tabs').innerHTML = STAGES.map((_,i) =>
+  `<div data-st="${i}" style="padding:3px 8px;border-radius:6px;cursor:pointer;font-size:11px;">${i+1}</div>`).join('');
+document.querySelectorAll('[data-st]').forEach(el => el.onclick = () => go(+el.dataset.st));
+document.getElementById('prev').onclick = () => go(cur-1);
+document.getElementById('next').onclick = () => go(cur+1);
+document.getElementById('play').onclick = () => {
+  go(0); let i = 0;
+  const id = setInterval(() => { i++; if (i >= STAGES.length) clearInterval(id); else go(i); }, 1600);
+};
+go(0);
+</script>
+</body></html>

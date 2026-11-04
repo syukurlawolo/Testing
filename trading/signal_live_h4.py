@@ -46,6 +46,8 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -87,6 +89,12 @@ MT4_ROOTS = [
 
 SYMBOL = "XAUUSD"
 PERIOD_MIN = 240
+
+# The broker writes bar timestamps in its own server clock, not UTC.
+# Maxrich runs GMT+2 (confirmed against the EA status file: server_time
+# 08:51 vs local_time 13:51 WIB = GMT+7). Any "age" calculation has to
+# subtract this offset before comparing against the real clock.
+SERVER_UTC_OFFSET_H = 2.0
 
 # How many H4 bars back a signal may still be actionable. The locked method's
 # limit expires after TTL_BARS = 2 bars, so a signal older than that is history.
@@ -173,11 +181,15 @@ def read_hst(path: Path) -> list[dict]:
     out = []
     for i in range(n):
         o = hdr + i * rec
-        t = struct.unpack("<i", b[o:o + 4])[0]
+        # V401 stores time and volume as int64, not int32. Reading them as
+        # int32 shifts every price field by 4 bytes and yields garbage
+        # (huge/negative floats, timestamps outside any sane range), which
+        # is why this used to raise "no plausible bars".
+        t = struct.unpack("<q", b[o:o + 8])[0]
         if not (1_000_000_000 < t < 2_200_000_000):
             continue
         o_, h_, l_, c_ = struct.unpack("<4d", b[o + 8:o + 40])
-        v = struct.unpack("<i", b[o + 40:o + 44])[0]
+        v = struct.unpack("<q", b[o + 40:o + 48])[0]
         if not (100 < o_ < 100_000):
             continue
         out.append(dict(ts=t, o=o_, h=h_, l=l_, c=c_, v=v))
@@ -196,6 +208,175 @@ def find_hst_files() -> list[Path]:
         for p in Path(root).rglob(f"{SYMBOL}{PERIOD_MIN}.hst"):
             found.append(p)
     return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# EA feed CSV reader (preferred source)
+# ---------------------------------------------------------------------------
+#
+# The .hst file is only rewritten sporadically - MT4 keeps live bars in memory
+# and flushes to disk on exit / timeframe switch, so the file on disk can be a
+# day or more behind the price on the chart. The companion EA
+# (MQL4/Experts/XAU_H4_FeedWriter.mq4) reads the live bars straight out of the
+# terminal and rewrites MQL4/Files/XAUUSD_H4_FEED.csv on every H4 close, so
+# that file is always the freshest view available without an external API.
+#
+# Feed CSV layout (semicolon-free, comma separated, MT4 FileWrite):
+#   date,time,open,high,low,close,volume
+#   2026.11.04,05:00,3934.79,4022.29,3926.64,4019.14,133555
+# Timestamps are in the broker's server clock, the same clock the locked
+# method's bar boundaries are built on, so no timezone shift is applied.
+
+FEED_NAME = f"{SYMBOL}_H4_FEED.csv"
+FEED_STATUS = f"{SYMBOL}_H4_STATUS.txt"
+
+# How old the EA feed may be before it stops being trusted as a SOURCE.
+# The EA only rewrites the CSV when an H4 bar closes, plus a 60-second heartbeat,
+# so a healthy feed is normally under 5 minutes old. 90 minutes was too tight:
+# one missed heartbeat pushed the robot onto the .hst fallback, which can be
+# DAYS older, and it then treated two-day-old levels as live signals. One full
+# H4 bar plus slack is the right horizon - anything fresher than that is still
+# describing the bar we are trading.
+FEED_MAX_AGE_MIN = 300
+
+# Separate, stricter question: is the data we ended up with FRESH ENOUGH to act
+# on? Falling back to .hst is fine for chart context, but a signal computed from
+# days-old bars is worse than no signal, so --run refuses to announce anything
+# past this age. /status still answers, with a warning.
+MAX_DATA_AGE_H = 5.0
+
+
+def read_ea_status() -> dict:
+    """Read the EA's live snapshot (bid/ask/spread). {} when unavailable.
+
+    The feed CSV only gains a row when an H4 bar CLOSES, so the newest close can
+    be hours old while the market is moving. This side file is what tells the
+    user where price actually is right now; it is display-only and never feeds
+    the method's calculations.
+    """
+    out = {}
+    try:
+        paths = [p.parent / FEED_STATUS for p in find_feed_files()]
+        paths = [p for p in paths if p.exists()]
+        if not paths:
+            return out
+        f = max(paths, key=lambda p: p.stat().st_mtime)
+        age_min = (time.time() - f.stat().st_mtime) / 60
+        kv = {}
+        for line in f.read_text(errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip()
+        out = {
+            "bid": float(kv.get("bid") or 0) or None,
+            "ask": float(kv.get("ask") or 0) or None,
+            "spread": float(kv.get("spread") or 0) or None,
+            "server_time": kv.get("server_time"),
+            "connected": kv.get("terminal_connected") == "1",
+            "age_min": age_min,
+            "fresh": age_min <= 5,
+        }
+    except Exception:
+        return {}
+    return out
+
+
+def find_feed_files() -> list[Path]:
+    """Locate the EA's H4 feed CSV across every MT4 terminal data folder."""
+    found = []
+    for root in MT4_ROOTS:
+        if not root or not str(root) or not Path(root).exists():
+            continue
+        for p in Path(root).rglob(FEED_NAME):
+            found.append(p)
+    return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def read_feed(path: Path) -> list[dict]:
+    """Parse the EA feed CSV into the same bar dicts read_hst() returns."""
+    import csv as _csv
+    import datetime as _dt
+
+    out = []
+    with path.open("r", encoding="latin-1", newline="") as fh:
+        for row in _csv.reader(fh):
+            if len(row) < 6:
+                continue
+            try:
+                ts = _dt.datetime.strptime(
+                    f"{row[0].strip()} {row[1].strip()}", "%Y.%m.%d %H:%M")
+                o_ = float(row[2]); h_ = float(row[3])
+                l_ = float(row[4]); c_ = float(row[5])
+            except (ValueError, IndexError):
+                continue        # header line and any malformed row
+            if not (100 < o_ < 100_000):
+                continue
+            v = 0
+            if len(row) > 6:
+                try:
+                    v = int(float(row[6]))
+                except ValueError:
+                    v = 0
+            out.append(dict(ts=int(ts.replace(tzinfo=_dt.timezone.utc).timestamp()),
+                            o=o_, h=h_, l=l_, c=c_, v=v))
+
+    if not out:
+        raise ValueError(f"{path.name}: no plausible bars after parsing")
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def feed_status(path: Path) -> dict:
+    """Read the EA status file written next to the feed CSV."""
+    sp = path.parent / FEED_STATUS
+    info = {}
+    if not sp.exists():
+        return info
+    try:
+        for line in sp.read_text(encoding="latin-1", errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return info
+
+
+def read_bars() -> tuple[list[dict], Path, str]:
+    """
+    Return (bars, source_path, source_kind), preferring the EA feed.
+
+    The feed is used when it exists and was written within FEED_MAX_AGE_MIN
+    minutes; otherwise fall back to the freshest .hst.
+    """
+    import time as _time
+
+    feeds = find_feed_files()
+    if feeds:
+        best = feeds[0]
+        age_min = (_time.time() - best.stat().st_mtime) / 60.0
+        if age_min <= FEED_MAX_AGE_MIN:
+            try:
+                return read_feed(best), best, "feed"
+            except ValueError:
+                pass        # fall through to .hst
+    return read_hst(freshest_hst()), freshest_hst(), "hst"
+
+
+def bars_source_report() -> str:
+    """One-line human summary of which source a run is reading."""
+    try:
+        bars, src, kind = read_bars()
+    except (SystemExit, ValueError) as exc:
+        return f"source: NONE ({exc})"
+    import time as _time
+    age_min = (_time.time() - src.stat().st_mtime) / 60.0
+    last = bars[-1]
+    import datetime as _dt
+    last_ts = _dt.datetime.utcfromtimestamp(last["ts"]).strftime("%d-%b %H:%M")
+    tag = "EA feed" if kind == "feed" else ".hst (stale source)"
+    return (f"source: {tag}  file age {age_min:.0f} min  "
+            f"bars {len(bars)}  last bar {last_ts}  close {last['c']:.2f}")
 
 
 def freshest_hst() -> Path:
@@ -247,11 +428,24 @@ def bars_to_frame(bars: list[dict]):
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # "sent" must be a list. An older/partial write left it as {} here,
+            # and then `st["sent"].append(k)` raised INSIDE the send loop - after
+            # the Telegram message had already gone out but BEFORE save_state(),
+            # so last_signal_key and the sent list were never persisted. Every
+            # 5-minute run then re-sent the same signal forever. Normalising on
+            # read makes that state self-healing instead of a permanent loop.
+            if isinstance(st.get("sent"), dict):
+                st["sent"] = list(st["sent"].keys())
+            if not isinstance(st.get("sent"), list):
+                st["sent"] = []
+            if not isinstance(st.get("sent_total"), int):
+                st["sent_total"] = len(st["sent"])
+            return st
         except json.JSONDecodeError:
             pass
     return dict(last_bar=None, last_signal_key=None, open_position=None,
-                pending=None, last_exit_bar=None, sent=[])
+                pending=None, last_exit_bar=None, sent=[], sent_total=0)
 
 
 def save_state(st: dict) -> None:
@@ -485,6 +679,23 @@ def scan(mod, bars: list[dict], full: bool = False) -> dict:
             # First ever run on an empty state: do not dump years of history.
             new = new[-1:]
 
+    # Hard safety net, independent of state: a fresh install (or a wiped
+    # signal_state.json) has last_key=None and sent={}, so the guard above
+    # does nothing and the FIRST --run would blast every historical trade to
+    # Telegram. Any trade older than the actionable window is history, never a
+    # signal, whether or not the state file remembers it.
+    if not full:
+        bounded, old = [], 0
+        for t in new:
+            if pd.Timestamp(t["entry_time"]) >= cutoff:
+                bounded.append(t)
+            else:
+                old += 1
+        if old:
+            print(f"  {old} historical trade(s) ignored - outside the "
+                  f"{MAX_SIGNAL_AGE_H4_BARS}-bar signal window")
+        new = bounded
+
     # Drop anything whose limit window has already closed.
     if not full:
         fresh, stale = [], 0
@@ -511,20 +722,24 @@ def scan(mod, bars: list[dict], full: bool = False) -> dict:
         ls = live_state(mod, df)
         if ls["kind"] in ("pending", "open"):
             i = ls["info"]
-            k = (f"{i['type']}|{i['entry']:.2f}|"
-                 f"{pd.Timestamp(i['sig_ts']):%Y-%m-%d %H:%M}")
+            live_sig = {
+                "action": i["type"],
+                "entry": i["entry"], "tp": i["tp"], "sl": i["sl"],
+                "level": i["level"], "tp_level": i["tp_level"],
+                "entry_time": pd.Timestamp(i["sig_ts"]),
+                "exit_time": None,
+                "result": "OPEN" if ls["kind"] == "open" else "PENDING",
+                "pl_usd": 0.0, "pl_pips": 0.0, "bars": ls["bars_used"],
+                "_live": True, "_kind": ls["kind"],
+            }
+            # Identity MUST come from sig_key(), the same function that wrote
+            # the saved key. The old code built its own
+            # "type|entry|YYYY-MM-DD HH:MM" string here, which never matched the
+            # saved "action|entry_time|level" form - so a live signal was
+            # considered brand new on every single run and re-announced forever.
+            k = sig_key(live_sig)
             already = k in seen or k == last_key
             if not already and pd.Timestamp(i["sig_ts"]) >= cutoff:
-                live_sig = {
-                    "action": i["type"],
-                    "entry": i["entry"], "tp": i["tp"], "sl": i["sl"],
-                    "level": i["level"], "tp_level": i["tp_level"],
-                    "entry_time": pd.Timestamp(i["sig_ts"]),
-                    "exit_time": None,
-                    "result": "OPEN" if ls["kind"] == "open" else "PENDING",
-                    "pl_usd": 0.0, "pl_pips": 0.0, "bars": ls["bars_used"],
-                    "_live": True, "_kind": ls["kind"],
-                }
                 # Do not duplicate: run() may already list this one as a
                 # finished trade only after it exits, so at this point it is
                 # guaranteed absent.
@@ -764,8 +979,7 @@ def build_positions_report() -> str:
     import pandas as pd
 
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     df = bars_to_frame(bars)
     tr = track_orders(mod, df)
     rows, ttl = tr["rows"], tr["ttl"]
@@ -875,8 +1089,7 @@ def build_status_report() -> str:
     import pandas as pd
 
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     df = bars_to_frame(bars)
 
     trades = mod.run(df, start=mod.START_DEFAULT).sort_values("entry_time")
@@ -903,51 +1116,80 @@ def build_status_report() -> str:
     L.append(f"<b>STATUS XAUUSD</b> · {datetime.now().strftime('%d-%b %H:%M')} WIB")
     L.append("")
 
-    if data_age_h > 6:
+    # --- harga live (dari file EA, hanya untuk tampilan) -------------------
+    ea = read_ea_status()
+    if ea.get("bid") and ea.get("fresh"):
+        sp = f" · spread {ea['spread']:.2f}" if ea.get("spread") else ""
+        L.append(f"💰 <b>Harga sekarang</b>  bid <code>{ea['bid']:.2f}</code>"
+                 f"  ask <code>{ea['ask']:.2f}</code>{sp}")
+        if newest_close:
+            d = ea["bid"] - newest_close
+            L.append(f"<i>{d:+.2f} dari close lilin {newest_close:.2f}</i>")
+    elif ea.get("bid"):
+        L.append(f"💰 Harga terakhir tercatat <code>{ea['bid']:.2f}</code> "
+                 f"<i>(EA diam {fmt_age(ea['age_min'] / 60)})</i>")
+    else:
+        L.append("<i>Harga live tidak terbaca — file status EA tidak ditemukan.</i>")
+    L.append("")
+
+    if data_age_h > MAX_DATA_AGE_H:
         L.append("🔴 <b>DATA MATI — JANGAN PASANG APA PUN.</b>")
         L.append("MT4 tidak memperbarui harga. Buka MT4, login, lalu ketik /status lagi.")
         L.append(f"<i>Harga terakhir {newest_close:.2f} dari {fmt_age(data_age_h)} lalu.</i>")
+        L.append("<i>Sinyal otomatis juga dimatikan selama data belum segar — "
+                 "robot tidak akan mengirim apa pun.</i>")
         L.append("")
         L.append("➖➖➖ <i>rincian</i> ➖➖➖")
         L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M}")
         return "\n".join(L)
 
     sc = plan_scenarios(newest_close, mod, ls)
-    buy = next((s for s in sc if s["side"] == "BUY"), None)
-    sell = next((s for s in sc if s["side"] == "SELL"), None)
 
-    L.append(f"Harga sekarang <b>{newest_close:.2f}</b>")
-    if ls["kind"] != "flat":
-        i = ls["info"]
-        act = "BUY" if i["type"] == "Buy" else "SELL"
-        L.append(f"<i>Ada sinyal {act} aktif — lihat pesan sinyalnya.</i>")
-    L.append("")
-    L.append("<b>Rencana pasang order</b>")
-    L.append("<i>Pasang semua yang ada di bawah, dua arah sekaligus.</i>")
-    L.append("<i>Yang satu kena, batalkan yang lain.</i>")
-    L.append("")
-    for s, nm in ((sell, "SELL"), (buy, "BUY")):
-        if s is None:
-            continue
-        emoji = "🔴" if nm == "SELL" else "🟢"
-        L.append(f"{emoji} <b>{nm}</b>")
-        L.append(f"Entry <code>{s['entry']:.2f}</code>")
-        L.append(f"SL <code>{s['sl']:.2f}</code>")
-        L.append(f"TP <code>{s['tp']:.2f}</code>")
+    # The method places an order ONLY on the bar after a close crosses a level.
+    # Anything that reads like "place these now" outside that state is wrong and
+    # gets acted on, so the verdict follows live_state() and nothing else.
+    live = ls["kind"]          # flat | pending | open
+
+    if live == "flat":
+        L.append(f"⚪ <b>TIDAK ADA YANG PERLU DIPASANG</b>")
         L.append("")
-    L.append("<i>Tekan angkanya untuk menyalin.</i>")
-    L.append("")
-
-    if ls["kind"] == "pending":
+        L.append(f"Close lilin terakhir <b>{newest_close:.2f}</b>")
+        L.append("<i>Metode belum memerintahkan order apa pun. Menunggu 1 lilin "
+                 "H4 tutup melewati garis level.</i>")
+    elif live == "pending":
         i = ls["info"]
         sisa = max(0, (ttl - ls["bars_used"]) * 4)
-        L.append(f"⚠️ Sinyal {i['type'].upper()} aktif tersisa <b>{sisa} jam</b> "
-                 f"bila belum terisi.")
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        emoji = "🟢" if act == "BUY" else "🔴"
+        L.append(f"🟡 <b>ADA ORDER {act} BELUM TERISI</b>")
         L.append("")
+        L.append(f"{emoji} <b>{act} LIMIT</b>")
+        L.append(f"Entry <code>{i['entry']:.2f}</code>")
+        L.append(f"SL <code>{i['sl']:.2f}</code>")
+        L.append(f"TP <code>{i['tp']:.2f}</code>")
+        L.append("")
+        L.append(f"<i>Sisa waktu <b>{sisa} jam</b> sebelum hangus. Kalau belum "
+                 f"terisi sampai itu, hapus ordernya.</i>")
+    else:  # open
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        emoji = "🟢" if act == "BUY" else "🔴"
+        L.append(f"🟢 <b>POSISI {act} SEDANG BERJALAN</b>")
+        L.append("")
+        L.append(f"{emoji} <b>{act}</b>")
+        L.append(f"Entry <code>{i['entry']:.2f}</code>")
+        L.append(f"SL <code>{i['sl']:.2f}</code>")
+        L.append(f"TP <code>{i['tp']:.2f}</code>")
+        L.append("")
+        L.append("<i>Sudah terisi. Biarkan berjalan sampai TP atau SL — "
+                 "posisi yang sudah masuk tidak punya batas waktu.</i>")
+
+    L.append("")
 
     L.append("➖➖➖ <i>rincian</i> ➖➖➖")
-    L.append(f"Lilin H4 terakhir : {newest_ts:%d-%b %H:%M} "
+    L.append(f"Close lilin H4 terakhir : {newest_ts:%d-%b %H:%M} "
              f"(data {fmt_age(data_age_h)} lalu)")
+    L.append("<i>Ini harga penutupan lilin, bukan harga live yang bergerak.</i>")
     L.append("Syarat sinyal: 1 lilin H4 <b>tutup</b> melewati garis level.")
     for s in sc:
         L.append(f"  {s['side']} lahir bila tutup di "
@@ -962,11 +1204,22 @@ def build_status_report() -> str:
 
 
     # --- health line ------------------------------------------------------
+    # "sent" only counts what this state file has announced since it was last
+    # reset, so a bare 0 reads as "the robot never sent anything" right after a
+    # reset - which is exactly when the user is most suspicious. Report the
+    # high-water mark instead and say what the number actually means.
     st = load_state()
+    sent = st.get("sent", [])
+    n_sent = len(sent) if isinstance(sent, (list, dict)) else 0
+    seen_max = st.get("sent_total", n_sent)
+    if n_sent == 0:
+        sent_txt = (f"{seen_max} sinyal pernah terkirim"
+                    if seen_max else "belum ada sinyal terkirim")
+    else:
+        sent_txt = f"{n_sent} sinyal terkirim sejak {st.get('reset_at', 'reset terakhir')}"
     L.append("")
     L.append(f"<i>{mod.METHOD_ID} v{mod.METHOD_VERSION} · "
-             f"{len(trades)} trade historis · "
-             f"{len(st.get('sent', []))} sinyal terkirim</i>")
+             f"{len(trades)} trade historis · {sent_txt}</i>")
     return "\n".join(L)
 
 
@@ -1023,8 +1276,7 @@ def build_plan_report() -> str:
     import pandas as pd
 
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     df = bars_to_frame(bars)
 
     newest_ts = pd.Timestamp(df.ts.iloc[-1])
@@ -1141,6 +1393,161 @@ def build_plan_report() -> str:
     return "\n".join(L)
 
 
+def build_month_report(month: str | None = None) -> str:
+    """
+    /report - every order the locked method produced this month, in a table.
+
+    Same engine as the backtest (track_orders walks the exact same code path that
+    produced the 348-trade baseline), so the list here can never disagree with
+    the backtest. The last row is the still-open plan, labelled Planning.
+    """
+    import pandas as pd
+
+    mod = load_locked()
+    bars, _hst, _src = read_bars()
+    df = bars_to_frame(bars)
+    tr = track_orders(mod, df)
+    rows = tr["rows"]
+
+    # Which month? default = month of the newest bar, not of the PC clock: around
+    # midnight on the 1st those differ, and the data is the honest answer.
+    newest_ts = pd.Timestamp(df.ts.iloc[-1])
+    if month:
+        month = month.strip()
+    else:
+        month = f"{newest_ts.month:02d}" if False else newest_ts.strftime("%Y-%m")
+    if len(month) == 2:
+        month = f"{newest_ts.year}-{month}"
+    try:
+        per = pd.Period(month, freq="M")
+    except Exception:
+        return (f"❓ Format bulan tidak dikenali: <b>{month}</b>\n"
+                f"Pakai <code>/report</code>, <code>/report 11</code>, "
+                f"atau <code>/report 2026-11</code>.")
+
+    sel = [r for r in rows if pd.Timestamp(r["sig_ts"]).to_period("M") == per]
+    sel.sort(key=lambda r: pd.Timestamp(r["sig_ts"]))
+
+    ttl = tr["ttl"]
+    newest_i = tr["newest_i"]
+    rr = mod.SL_RR_RATIO
+    buf, cap = mod.BUFFER_USD, mod.CAP_USD
+
+    # --- classify every row into the exit label the user asked for ---------
+    def label(r) -> str:
+        st = r["state"]
+        if st == "TP":
+            return "TP"
+        if st == "SL":
+            return "LOSS"
+        if st == "batal":
+            return "BATAL (limit hangus)"
+        if st == "terisi":
+            return "RUNNING"
+        # 'menunggu' = pending never touched. It is still Planning only while its
+        # window is open; once the window has passed it expired, full stop.
+        left = ttl - (newest_i - r.get("fill_i", r.get("bar", 0)))
+        return "RUNNING (limit menunggu)" if left >= 0 else "BATAL (limit hangus)"
+
+    lt = []
+    lt.append(f"<b>📋 REPORT SINYAL XAUUSD · {per.strftime('%B %Y')}</b>")
+    lt.append(f"<i>Metode baku {mod.METHOD_ID} v{mod.METHOD_VERSION} · H4</i>")
+    lt.append("")
+
+    if not sel:
+        lt.append(f"Belum ada sinyal di bulan ini (data s/d {newest_ts:%d-%b %Y %H:%M}).")
+        lt.append("")
+        lt.append("<b>PLANNING</b>")
+        lt.append(_report_plan_line(mod, df, tr, newest_ts, buf, cap, rr))
+        return "\n".join(lt)
+
+    tp = sum(1 for r in sel if r["state"] == "TP")
+    sl = sum(1 for r in sel if r["state"] == "SL")
+    bat = sum(1 for r in sel if r["state"] == "batal")
+    run = len(sel) - tp - sl - bat
+    done = tp + sl
+
+    # --- the table ---------------------------------------------------------
+    # Telegram is ~40 monospace chars wide on a phone. Values sit on their own
+    # line under each header so nothing wraps mid-number.
+    lt.append(f"<b>tanggal | jenis | entry | tp | sl | keterangan</b>")
+    lt.append("<pre>")
+    for r in sel:
+        ts = pd.Timestamp(r["sig_ts"])
+        act = "BUY" if r["type"] == "Buy" else "SELL"
+        lt.append(f"{ts:%d-%b %H:%M} | {act:<4} | {r['entry']:.2f}")
+        lt.append(f"   tp {r['tp']:.2f}  sl {r['sl']:.2f} | {label(r)}")
+    lt.append("</pre>")
+
+    # --- planning row ------------------------------------------------------
+    lt.append("")
+    lt.append("<b>PLANNING (baris terakhir)</b>")
+    lt.append(_report_plan_line(mod, df, tr, newest_ts, buf, cap, rr))
+
+    # --- recap -------------------------------------------------------------
+    lt.append("")
+    lt.append("<b>REKAP BULAN INI</b>")
+    lt.append(f"  Total sinyal : {len(sel)}")
+    if done:
+        lt.append(f"  Selesai      : {done}  (TP {tp} · LOSS {sl})")
+        lt.append(f"  Win rate     : <b>{100 * tp / done:.2f}%</b>")
+        pl = tp * cap - sl * cap * rr
+        lt.append(f"  Estimasi P/L : <b>{pl:+.2f}</b> USD per 1.00 lot")
+    if bat:
+        lt.append(f"  Limit hangus : {bat}")
+    if run:
+        lt.append(f"  Masih jalan  : {run}")
+    lt.append("")
+    lt.append("<i>Angka di atas berasal dari mesin yang sama dengan backtest "
+             "348 trade (WR 58,62%). Kalau backtest berubah, tabel ini ikut "
+             "berubah — tidak mungkin berbeda.</i>")
+    return "\n".join(lt)
+
+
+def _report_plan_line(mod, df, tr, newest_ts, buf, cap, rr) -> str:
+    """One planning row: what to place next, at which price, and how."""
+    import pandas as pd
+
+    ls = live_state(mod, df)
+    ttl = tr["ttl"]
+    L = []
+
+    if ls["kind"] in ("pending", "open"):
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        sisa = max(0, (ttl - ls["bars_used"]) * 4)
+        L.append(f"<pre>{pd.Timestamp(i['sig_ts']):%d-%b %H:%M} | {act:<4} | "
+                 f"{i['entry']:.2f}")
+        L.append(f"   tp {i['tp']:.2f}  sl {i['sl']:.2f} | "
+                 f"{'RUNNING' if ls['kind'] == 'open' else 'MENUNGGU TERISI'}</pre>")
+        if ls["kind"] == "open":
+            L.append("Sudah terisi — jangan pasang apa pun lagi sampai TP/SL kena.")
+        else:
+            L.append(f"Pasang <b>{act} LIMIT</b> di <b>{i['entry']:.2f}</b>, "
+                     f"batalkan kalau {sisa} jam lagi belum terisi.")
+        return "\n".join(L)
+
+    scen = plan_scenarios(float(df.c.iloc[-1]), mod, ls)
+    if not scen:
+        return "Tidak ada level valid — tidak ada yang dipasang."
+
+    L.append(f"<i>Harga acuan: close H4 {newest_ts:%d-%b %H:%M} = "
+             f"{float(df.c.iloc[-1]):.2f}</i>")
+    for s in scen:
+        side = "BUY" if s["side"] == "BUY" else "SELL"
+        jenis = "BUY LIMIT" if side == "BUY" else "SELL LIMIT"
+        arah = "atas" if side == "BUY" else "bawah"
+        L.append("")
+        L.append(f"<b>{side} — pasang kalau 1 lilin H4 tutup {arah} "
+                 f"{s['level']:.2f}</b>")
+        L.append(f"  Jenis  : <b>{jenis}</b> di <b>{s['entry']:.2f}</b>")
+        L.append(f"  TP <code>{s['tp']:.2f}</code>   SL <code>{s['sl']:.2f}</code>")
+        L.append(f"  Kapan  : <i>jangan pasang sekarang.</i> Tunggu lilin H4 "
+                 f"tutup di {arah} {s['level']:.2f}, baru pasang limitnya.")
+        L.append(f"  Batas  : hangus {ttl * 4} jam kalau tidak tersentuh")
+    return "\n".join(L)
+
+
 def tg_get_updates(token: str, offset: int | None = None) -> list[dict]:
     """
     Fetch pending messages.
@@ -1189,11 +1596,16 @@ def cmd_poll() -> int:
         # from a broken schedule.
         if cmd in ("/mulai", "/start", "/help", "/bantuan"):
             reply = ("<b>Robot XAUUSD H4 aktif.</b>\n\n"
-                     "<b>/posisi</b> — order mana yang jalan, mana yang harus dihapus\n"
+                     "<b>/report</b> — semua sinyal bulan ini + planning\n"
+                     "<b>/plan</b> — skenario lengkap: entry, TP, SL, risiko\n"
                      "<b>/status</b> — apa yang harus saya pasang sekarang\n"
-                     "<b>/plan</b> — skenario lengkap: entry, TP, SL, risiko\n\n"
+                     "<b>/posisi</b> — order mana yang jalan, mana yang harus dihapus\n\n"
+                     "<code>/report 10</code> untuk bulan lain.\n"
                      "Sinyal baru saya kirim otomatis begitu lilin H4 tutup.\n"
                      "<i>Ketik perintah kapan saja, tidak perlu menunggu.</i>")
+        elif cmd in ("/report", "/laporan", "/rekap", "/history", "/riwayat"):
+            arg = text.split()[1] if len(text.split()) > 1 else None
+            reply = build_month_report(arg)
         elif cmd in ("/posisi", "/pos", "/position", "/order", "/running"):
             reply = build_positions_report()
         elif cmd in ("/plan", "/rencana"):
@@ -1202,9 +1614,10 @@ def cmd_poll() -> int:
             reply = build_status_report()
         else:
             reply = ("Perintah itu belum ada.\n\n"
-                     "<b>/posisi</b> — order jalan / harus dihapus\n"
+                     "<b>/report</b> — semua sinyal bulan ini + planning\n"
+                     "<b>/plan</b> — skenario entry, TP, SL, risiko\n"
                      "<b>/status</b> — apa yang harus dipasang sekarang\n"
-                     "<b>/plan</b> — skenario entry, TP, SL, risiko")
+                     "<b>/posisi</b> — order jalan / harus dihapus")
         # /status answers are priority 3: they must never look like a signal.
         send_all(reply, title="Status XAUUSD", priority=3)
         answered += 1
@@ -1218,11 +1631,18 @@ def cmd_poll() -> int:
 
 
 def describe_source(bars: list[dict]) -> str:
-    last = datetime.fromtimestamp(bars[-1]["ts"], timezone.utc)
-    first = datetime.fromtimestamp(bars[0]["ts"], timezone.utc)
-    age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
-    return (f"bars {len(bars)}  {first:%Y-%m-%d %H:%M} -> {last:%Y-%m-%d %H:%M} "
-            f"(server)  age {age_h:.1f}h")
+    """
+    Bar timestamps are the broker's SERVER clock, not UTC. The Maxrich feed
+    writes GMT+2, so treating them as UTC made "now - last bar" come out
+    negative and printed times two hours ahead. Convert server -> UTC with
+    SERVER_UTC_OFFSET_H before comparing against the real clock.
+    """
+    off = timedelta(hours=SERVER_UTC_OFFSET_H)
+    last_srv = datetime.fromtimestamp(bars[-1]["ts"], timezone.utc)
+    first_srv = datetime.fromtimestamp(bars[0]["ts"], timezone.utc)
+    age_h = (datetime.now(timezone.utc) - (last_srv - off)).total_seconds() / 3600
+    return (f"bars {len(bars)}  {first_srv:%Y-%m-%d %H:%M} -> {last_srv:%Y-%m-%d %H:%M} "
+            f"(server GMT+{SERVER_UTC_OFFSET_H:g})  age {age_h:.1f}h")
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +1662,7 @@ def cmd_sources() -> int:
         mt = datetime.fromtimestamp(f.stat().st_mtime)
         size = f.stat().st_size
         try:
-            bars = read_hst(f)
+            bars = read_feed(f)
             info = describe_source(bars)
         except Exception as e:
             info = f"PARSE ERROR: {e}"
@@ -1256,8 +1676,7 @@ def cmd_sources() -> int:
 def cmd_test() -> int:
     cfg = load_config()
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     msg = (
         "<b>XAUUSD locked H4 · test message</b>\n\n"
         f"Method : {mod.METHOD_ID} v{mod.METHOD_VERSION}\n"
@@ -1273,8 +1692,7 @@ def cmd_test() -> int:
 
 def cmd_status() -> int:
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     st = load_state()
     cfg = None
     try:
@@ -1289,7 +1707,11 @@ def cmd_status() -> int:
     print(f"source     : {hst}")
     print(f"bars       : {describe_source(bars)}")
     print(f"telegram   : {'configured (' + cfg['source'] + ')' if cfg and cfg.get('chat_id') else 'NOT configured'}")
-    print(f"last bar   : {st.get('last_bar')}")
+    _last_dt = datetime.fromtimestamp(bars[-1]["ts"], timezone.utc)
+    _last_ago = (datetime.now(timezone.utc)
+                 - (_last_dt - timedelta(hours=SERVER_UTC_OFFSET_H))).total_seconds() / 3600
+    print(f"last bar   : {_last_dt:%Y-%m-%d %H:%M} server "
+          f"({_last_ago:.1f}h ago)")
     print(f"last signal: {st.get('last_signal_key')}")
     print(f"sent total : {len(st.get('sent', []))}")
     if st.get("open_position"):
@@ -1299,8 +1721,7 @@ def cmd_status() -> int:
 
 def cmd_check() -> int:
     mod = load_locked()
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
     r = scan(mod, bars, full=True)
 
     print("=" * 68)
@@ -1324,6 +1745,294 @@ def cmd_check() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Per-bar briefing (the message the user asked for: one verdict per H4 close)
+# ---------------------------------------------------------------------------
+
+QUIET_FROM = 23   # WIB hour after which 'nothing happened' briefings are held
+QUIET_TO = 7      # WIB hour before which they are held
+
+
+def _bar_close_wib(ts) -> datetime:
+    """Server bar timestamp -> the wall clock in WIB when that bar CLOSED."""
+    import pandas as pd
+    close_srv = pd.Timestamp(ts) + pd.Timedelta(hours=4)
+    # server clock is SERVER_UTC_OFFSET_H ahead of UTC; local is UTC+7
+    return (close_srv.to_pydatetime()
+            - timedelta(hours=SERVER_UTC_OFFSET_H)
+            + timedelta(hours=7))
+
+
+def _in_quiet_hours() -> bool:
+    h = datetime.now().hour
+    return h >= QUIET_FROM or h < QUIET_TO
+
+
+def build_bar_briefing(regime: int = 7) -> tuple[str, str, str]:
+    """
+    What to send right after an H4 bar closes.
+
+    Returns (kind, title, text). kind is one of:
+      signal | filled | closed | expired | waiting | running | stale
+
+    The whole point is that the user never has to wonder: every H4 close gets an
+    answer, and the answer always says what to do about the NEXT bar. 'waiting'
+    (nothing happened) is the only kind that may be withheld during quiet hours;
+    everything else asks the user to act and always goes out.
+    """
+    import pandas as pd
+
+    mod = load_locked()
+    bars, hst, _src = read_bars()
+    df = bars_to_frame(bars)
+    st = load_state()
+
+    newest_ts = pd.Timestamp(df.ts.iloc[-1])
+    newest_close = float(df.c.iloc[-1])
+    off = timedelta(hours=SERVER_UTC_OFFSET_H)
+    last_srv = datetime.fromtimestamp(bars[-1]["ts"], timezone.utc) - off
+    age_h = (datetime.now(timezone.utc) - last_srv).total_seconds() / 3600
+
+    # --- 0. data dead: say so once, then stay quiet ------------------------
+    if age_h > MAX_DATA_AGE_H:
+        prev = st.get("stale_notified_for")
+        if prev == f"{newest_ts:%Y-%m-%d %H:%M}":
+            return "stale", "", ""          # already warned for this bar
+        st["stale_notified_for"] = f"{newest_ts:%Y-%m-%d %H:%M}"
+        save_state(st)
+        txt = (f"🔴 <b>DATA MATI — jangan ambil keputusan</b>\n\n"
+               f"Lilin terakhir {newest_ts:%d-%b %H:%M} server, sudah "
+               f"{fmt_age(age_h)} lalu.\n"
+               f"MT4 kemungkinan tertutup atau belum login.\n\n"
+               f"Sinyal otomatis saya hentikan sampai data segar lagi.\n"
+               f"Buka MT4, login, lalu ketik /status.")
+        return "stale", "DATA MATI XAUUSD", txt
+    st.pop("stale_notified_for", None)
+
+    ls = live_state(mod, df)
+    ttl = ls["ttl"]
+    ea = read_ea_status()
+    # The EA's bid/ask describes the CURRENT market. It is only meaningful when
+    # the newest bar is the one still forming; on a replay of older bars it would
+    # quote today's price next to a two-day-old plan, which is worse than useless.
+    live_px = (ea.get("bid")
+               if ea.get("fresh") and age_h <= 4.5 else None)
+
+    # --- 1. something just finished? ---------------------------------------
+    # A trade whose exit bar IS the newest bar (or the one before it, since the
+    # driver may fire a minute after the close) is news worth telling.
+    tr = track_orders(mod, df)
+    newest_i = tr["newest_i"]
+
+    # Is there a brand-new signal on this bar? Checked FIRST, because on a bar
+    # where a trade closes the method immediately re-arms (a fresh breakout can
+    # happen the very next bar), and in that case the signal is the actionable
+    # news - the exit is already history.
+    #
+    # Deliberately NOT scan(): scan compares against live_state(), which only
+    # knows what is open RIGHT NOW. A signal born on an older bar that already
+    # exited (or is several bars back) is invisible to it, so scan would keep
+    # offering stale entries as 'new'. track_orders() replays every signal with
+    # its own timestamp and state, which is what "born on this bar" needs.
+    for x in tr["rows"]:
+        if pd.Timestamp(x["sig_ts"]) != newest_ts:
+            continue
+        k = sig_key({"action": x["type"],
+                     "entry_time": pd.Timestamp(x["sig_ts"]),
+                     "level": x["level"]})
+        seen = st.setdefault("sent", [])
+        if k in seen or k == st.get("last_signal_key"):
+            continue
+        seen.append(k)
+        st["sent_total"] = int(st.get("sent_total", 0)) + 1
+        st["last_signal_key"] = k
+        st["open_position"] = {
+            "action": x["type"], "entry": x["entry"], "tp": x["tp"],
+            "sl": x["sl"], "signal_time": str(x["sig_ts"]), "level": x["level"],
+        }
+        save_state(st)
+        sig = {"action": x["type"], "entry": x["entry"], "tp": x["tp"],
+               "sl": x["sl"], "level": x["level"],
+               "tp_level": x.get("tp_level"),
+               "entry_time": pd.Timestamp(x["sig_ts"]),
+               "exit_time": None,
+               "result": "OPEN" if x["state"] == "terisi" else "PENDING",
+               "pl_usd": 0.0, "pl_pips": 0.0, "bars": 0}
+        return "signal", "", fmt_signal(sig, df.ts.iloc[-1])
+
+    finished = [x for x in tr["rows"]
+                if x.get("exit_i") in (newest_i, newest_i - 1)
+                and x["state"] in ("TP", "SL")]
+    for x in finished:
+        k = f"exit|{x['sig_ts']}|{x['exit_ts']}|{x['state']}"
+        seen = st.setdefault("notified_exits", [])
+        if k in seen:
+            continue
+        seen.append(k)
+        st["notified_exits"] = seen[-40:]
+        save_state(st)
+        act = "BUY" if x["type"] == "Buy" else "SELL"
+        if x["state"] == "TP":
+            pl = abs(x["tp"] - x["entry"])
+            head = (f"✅ <b>{act} {x['entry']:.2f} — KENA TP</b>\n\n"
+                    f"Tutup di <code>{x['tp']:.2f}</code>.\n"
+                    f"<b>Hasil +{pl:.2f} USD</b> per 1.00 lot.\n"
+                    f"Durasi {max(1, (x['exit_i'] - x.get('fill_i', x['exit_i']))) * 4} jam.")
+        else:
+            pl = abs(x["entry"] - x["sl"])
+            head = (f"❌ <b>{act} {x['entry']:.2f} — KENA SL</b>\n\n"
+                    f"Tutup di <code>{x['sl']:.2f}</code>.\n"
+                    f"<b>Hasil −{pl:.2f} USD</b> per 1.00 lot.\n"
+                    f"Kerugian ini sudah diperhitungkan metode — "
+                    f"jangan balas dendam buka posisi baru.")
+        # A trade that just closed is ALSO the answer to "what now?", so the
+        # forward-looking part is never dropped - only the bare 'waiting' header
+        # would be redundant here.
+        scen = plan_scenarios(newest_close, mod, ls)
+        tail = ["", "Metode jeda 1 lilin dulu. <b>Jangan pasang order baru sekarang.</b>"]
+        if scen:
+            nxt = newest_ts + pd.Timedelta(hours=4)
+            tail.append("")
+            tail.append(f"<b>Yang ditunggu di lilin {nxt:%H:%M}:</b>")
+            for s in scen:
+                up = s["side"] == "BUY"
+                d = abs(s["level"] - newest_close)
+                tail.append(f"  {'🟢' if up else '🔴'} tutup "
+                            f"<b>{'di atas' if up else 'di bawah'} "
+                            f"{s['level']:.2f}</b> → {s['side']} limit "
+                            f"{s['entry']:.2f} <i>({d:.2f} poin)</i>")
+            tail.append("  ⚪ tutup di antaranya → tidak ada apa-apa")
+        return "closed", f"HASIL {act} XAUUSD {'TP' if x['state'] == 'TP' else 'SL'}", \
+            head + "\n" + "\n".join(tail)
+
+    # --- 2. a pending order that expired unfilled? -------------------------
+    if ls["kind"] == "flat":
+        for x in tr["rows"]:
+            if x["state"] != "batal":
+                continue
+            k = f"expired|{x['sig_ts']}"
+            seen = st.setdefault("notified_exits", [])
+            if k in seen or x.get("exit_i") != newest_i:
+                continue
+            seen.append(k)
+            st["notified_exits"] = seen[-40:]
+            save_state(st)
+            act = "BUY" if x["type"] == "Buy" else "SELL"
+            txt = (f"❌ <b>{act} LIMIT {x['entry']:.2f} — HANGUS</b>\n\n"
+                   f"Sudah {ttl * 4} jam tidak tersentuh. "
+                   f"<b>Hapus ordernya di MT4.</b>\n\n"
+                   f"Ini <b>bukan kerugian</b> — tidak ada uang keluar, "
+                   f"cuma tidak jadi trading.")
+            scen = plan_scenarios(newest_close, mod, ls)
+            if scen:
+                txt += "\n\n<b>Yang ditunggu sekarang:</b>"
+                for s in scen:
+                    txt += (f"\n  {s['side']} kalau tutup "
+                            f"{'di atas' if s['side'] == 'BUY' else 'di bawah'} "
+                            f"{s['level']:.2f}")
+            return "expired", f"HANGUS {act} XAUUSD", txt
+
+    # --- 3. (signal check moved above: it must win over an exit note) ------
+
+    # --- 4. position open: short 'still running' note ----------------------
+    if ls["kind"] == "open":
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        txt = [f"🟢 <b>{act} {i['entry']:.2f} masih berjalan</b>",
+               f"TP <code>{i['tp']:.2f}</code> · SL <code>{i['sl']:.2f}</code>"]
+        if live_px:
+            txt.append(f"Harga sekarang <b>{live_px:.2f}</b> — "
+                       f"<b>{live_px - i['entry']:+.2f}</b> dari entry.")
+        txt.append(f"Sudah {ls['bars_used'] * 4} jam berjalan.")
+        txt.append("Kalau TP/SL kena, saya kabari.")
+        return "running", f"POSISI {act} JALAN", "\n".join(txt)
+
+    # --- 5. pending open: remind the window -------------------------------
+    if ls["kind"] == "pending":
+        i = ls["info"]
+        act = "BUY" if i["type"] == "Buy" else "SELL"
+        sisa_h = max(0, (ttl - ls["bars_used"]) * 4)
+        txt = [f"⏳ <b>{act} LIMIT {i['entry']:.2f} — belum terisi</b>",
+               f"Sisa waktu <b>{sisa_h} jam</b>.",
+               f"TP <code>{i['tp']:.2f}</code> · SL <code>{i['sl']:.2f}</code>"]
+        if live_px:
+            d = live_px - i["entry"]
+            txt.append(f"Harga sekarang {live_px:.2f} — masih "
+                       f"{abs(d):.2f} poin "
+                       f"{'di atas' if d > 0 else 'di bawah'} entry.")
+        txt.append("Biarkan ordernya. Kalau hangus, saya kabari untuk hapus.")
+        return "filled", f"{act} LIMIT MENUNGGU", "\n".join(txt)
+
+    # --- 6. nothing at all: the 'waiting' briefing ------------------------
+    scen = plan_scenarios(newest_close, mod, ls)
+    why = []
+    if len(df) >= 2:
+        prev_c = float(df.c.iloc[-2])
+        why.append(f"Lilin {newest_ts:%H:%M} tutup <b>{newest_close:.2f}</b> "
+                   f"(sebelumnya {prev_c:.2f}) — tidak menembus garis mana pun.")
+    else:
+        why.append(f"Lilin tutup <b>{newest_close:.2f}</b> — tidak ada penembusan.")
+
+    txt = [f"📊 <b>XAUUSD · lilin {newest_ts:%d-%b %H:%M} tutup</b>", ""]
+    txt += why
+    txt.append("Tidak ada sinyal. <b>Jangan pasang order apa pun.</b>")
+    if live_px:
+        txt.append(f"Harga sekarang <b>{live_px:.2f}</b>.")
+    if scen:
+        nxt = newest_ts + pd.Timedelta(hours=4)
+        txt.append("")
+        txt.append(f"<b>Yang ditunggu di lilin {nxt:%H:%M}:</b>")
+        for s in scen:
+            up = s["side"] == "BUY"
+            emo = "🟢" if up else "🔴"
+            d = abs(s["level"] - (live_px or newest_close))
+            txt.append(f"  {emo} tutup <b>{'di atas' if up else 'di bawah'} "
+                       f"{s['level']:.2f}</b> → {s['side']} limit "
+                       f"{s['entry']:.2f} <i>({d:.2f} poin)</i>")
+        txt.append("  ⚪ tutup di antaranya → tidak ada apa-apa")
+
+    return "waiting", f"XAUUSD {newest_ts:%H:%M}", "\n".join(txt)
+
+
+def cmd_briefing() -> int:
+    """
+    Driver entry: send the per-bar briefing unless it is a quiet-hours 'waiting'.
+
+    Runs are gated on the bar itself, not the clock, so a 5-minute schedule can
+    call this freely: each bar produces at most one message.
+    """
+    # Claim the bar BEFORE building the message. build_bar_briefing() saves its
+    # own bookkeeping (which exits were announced), and that save would happily
+    # overwrite a marker written afterwards - which is exactly how the same
+    # 'nothing happened' note went out on every run.
+    st = load_state()
+    newest = st.get("last_bar")
+    if st.get("briefed_bar") == newest:
+        print(f"  briefing: already sent for bar {newest}")
+        return 0
+
+    kind, title, text = build_bar_briefing()
+    if not text:
+        print(f"  briefing: nothing to say ({kind})")
+        return 0
+
+    if kind == "waiting" and _in_quiet_hours():
+        print(f"  briefing: {kind} suppressed (quiet hours "
+              f"{QUIET_FROM:02d}:00-{QUIET_TO:02d}:00 WIB)")
+        return 0
+
+    prio = 5 if kind in ("signal", "closed") else 3
+    res = send_all(text, title=title, priority=prio)
+    ok = res["telegram"] or res["ntfy"]
+    print(f"  briefing {kind}: {'SENT' if ok else 'FAILED'} "
+          f"(telegram={res['telegram']} ntfy={res['ntfy']})")
+    if ok:
+        st = load_state()          # re-read: build_bar_briefing may have saved
+        st["briefed_bar"] = newest
+        save_state(st)
+    return 0
+
+
 def cmd_run(dry: bool = False) -> int:
     return _run(dry)
 
@@ -1336,10 +2045,38 @@ def _run(dry: bool = False) -> int:
     except SystemExit as e:
         print(f"WARNING: {e}\nSignals will print to console only.")
 
-    hst = freshest_hst()
-    bars = read_hst(hst)
+    bars, hst, _src = read_bars()
+    st = load_state()
+
+    # --- data-freshness gate ------------------------------------------------
+    # A signal is only worth sending if the bar it came from is recent. When MT4
+    # or the EA is down, read_bars() still returns something (the .hst fallback,
+    # possibly days old), and the method happily computes trades on it. Sending
+    # those would tell the user to place a limit around a price the market left
+    # long ago. Refuse, say why, and let /status carry the warning instead.
+    off = timedelta(hours=SERVER_UTC_OFFSET_H)
+    last_srv = datetime.fromtimestamp(bars[-1]["ts"], timezone.utc) - off
+    data_age_h = (datetime.now(timezone.utc) - last_srv).total_seconds() / 3600
+    if data_age_h > MAX_DATA_AGE_H:
+        print(f"  DATA STALE: last bar {last_srv:%Y-%m-%d %H:%M} server "
+              f"({data_age_h:.1f}h old) - no signal sent")
+        print(f"  (limit {MAX_DATA_AGE_H:g}h; source {hst.name})")
+        print("  Check MT4 is open, logged in, and the EA is on the chart.")
+        dbg = load_state()
+        dbg["data_stale"] = {
+            "age_h": round(data_age_h, 1),
+            "last_bar": f"{last_srv:%Y-%m-%d %H:%M}",
+            "source": hst.name,
+            "checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if not dry:
+            save_state({**dbg})
+        return 0
+    st.pop("data_stale", None)
     r = scan(mod, bars)
-    st = r.get("state") or load_state()
+    if r.get("state"):
+        st.update(r["state"])
+        st.pop("data_stale", None)
 
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {hst.name}  {describe_source(bars)}")
@@ -1354,6 +2091,32 @@ def _run(dry: bool = False) -> int:
 
     sent_ok = 0
     for t in r["new"]:
+        # Record the signal in state BEFORE sending it. The old order sent first
+        # and saved last, so any exception between the two (a malformed "sent"
+        # entry, a crash, a closed console) meant the same signal was re-sent on
+        # every following run, every 5 minutes, indefinitely. Claiming it first
+        # turns a failed send into a missed message - visible and harmless -
+        # instead of an infinite repeat of a stale one.
+        k = sig_key(t)
+        claimed = False
+        if not dry:
+            already = (k in st["sent"]) or (k == st.get("last_signal_key"))
+            if not already:
+                st["sent"].append(k)
+                st["sent_total"] = int(st.get("sent_total", 0)) + 1
+                st["last_signal_key"] = k
+                st["open_position"] = {
+                    "action": t["action"], "entry": t["entry"], "tp": t["tp"],
+                    "sl": t["sl"], "signal_time": str(t["entry_time"]),
+                    "level": t["level"],
+                }
+                save_state(st)
+                claimed = True
+            else:
+                print(f"  already announced, skipping: {t['action']} "
+                      f"{t['entry']:.2f}")
+                continue
+
         msg = fmt_signal(t, r["last_bar"])
         # priority 5 = urgent: pops over other apps, can beat Do Not Disturb.
         # Only ever used for a real signal, so 'urgent' keeps its meaning.
@@ -1364,16 +2127,19 @@ def _run(dry: bool = False) -> int:
         print(f"  {'SENT' if ok else 'FAILED'}: {t['action']} "
               f"{t['entry']:.2f} TP {t['tp']:.2f} SL {t['sl']:.2f} "
               f"(telegram={res['telegram']} ntfy={res['ntfy']})")
+        if not ok and claimed:
+            # Delivery failed after we claimed it. Put it back so the next run
+            # retries - and so a real signal is never silently swallowed.
+            try:
+                st["sent"].remove(k)
+                st["sent_total"] = max(0, int(st.get("sent_total", 1)) - 1)
+                if st.get("last_signal_key") == k:
+                    st["last_signal_key"] = st["sent"][-1] if st["sent"] else None
+                st.pop("open_position", None)
+                save_state(st)
+            except ValueError:
+                pass
         if ok and not dry:
-            k = sig_key(t)
-            if k not in st.setdefault("sent", []):
-                st["sent"].append(k)
-            st["last_signal_key"] = k
-            st["open_position"] = {
-                "action": t["action"], "entry": t["entry"], "tp": t["tp"],
-                "sl": t["sl"], "signal_time": str(t["entry_time"]),
-                "level": t["level"],
-            }
             log_signal({**{k2: (str(v) if k2.endswith("_time") else v)
                            for k2, v in t.items()}, "announced": stamp})
             sent_ok += 1
@@ -1394,6 +2160,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sources", action="store_true", help="find MT4 history files")
     ap.add_argument("--poll", action="store_true",
                     help="answer /status commands sent to the bot")
+    ap.add_argument("--briefing", action="store_true",
+                    help="send the per-bar verdict (one message per H4 close)")
     ap.add_argument("--dry", action="store_true", help="with --run: do not send")
     a = ap.parse_args(argv)
 
@@ -1407,6 +2175,8 @@ def main(argv=None) -> int:
         return cmd_check()
     if a.poll:
         return cmd_poll()
+    if a.briefing:
+        return cmd_briefing()
     if a.run:
         return _run(a.dry)
 

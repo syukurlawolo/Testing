@@ -20,7 +20,11 @@ cd /d "C:\Users\Sharing Vision\AppData\Local\hermes\trading"
 "%PYTHON%" "%BOT%" --run > "%LOGDIR%\run_!STAMP!.log" 2>&1
 set RC=!errorlevel!
 
-REM Also answer any /status command that arrived since the last check.
+REM Per-bar verdict: what just happened, what to do now, which 2 prices matter
+REM next. Gated on the bar itself, so one message per H4 close at most.
+"%PYTHON%" "%BOT%" --briefing >> "%LOGDIR%\run_!STAMP!.log" 2>&1
+
+REM Also answer any /status, /report, /plan, /posisi that arrived since the last check.
 "%PYTHON%" "%BOT%" --poll >> "%LOGDIR%\run_!STAMP!.log" 2>&1
 
 if not "!RC!"=="0" (

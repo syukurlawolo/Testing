@@ -77,9 +77,14 @@ correct so the user's remaining action is a single click:
   4. a `CARA-PUSH.md`: how to mint a Personal Access Token, which scope (`repo`),
      and the error-to-cause table (`Authentication failed`, "password auth was
      removed", `Permission denied`, `Updates were rejected`)
+  5. a `SYNC.bat` so later changes refresh the repo in one click — see
+     `references/repo-sync-to-git.md`. Staging the repo once without a sync
+     script leaves the next session redoing the copy by hand and re-breaking it.
 
 Name the blocking fact plainly in the reply — "no token on this machine, so I
-cannot push" — then hand over the staged repo.
+cannot push" — then hand over the staged repo. Do not open a browser to solve a
+credential prompt and do not ask for a password or token in chat: the user
+pushes. Report the number of unpushed commits so the gap is visible.
 
 HONEST CAVEATS TO CARRY INTO THE REPORT
 ---------------------------------------
