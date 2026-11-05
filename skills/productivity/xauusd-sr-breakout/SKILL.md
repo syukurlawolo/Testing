@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.9.6
+version: 1.9.7
 author: Hermes Agent
 license: MIT
 ---
@@ -246,6 +246,41 @@ its own emoji so the notification itself says which one arrived: `signal` / `clo
   H4 close (server 01/05/09/13/17/21 → WIB 06/10/14/18/22/02:02). Six
   `<CalendarTrigger>` blocks in one XML, `StartBoundary` = next occurrence, and confirm
   with `schtasks /query /v`: six `Start Time` rows and `Repeat: Disabled`.
+
+### Answering "is this a real signal or your test?" — label every manual send
+
+An unlabelled test message is indistinguishable from a live signal, and this user
+explicitly checks whether a signal was real. Two rules, both mandatory:
+
+- **Prefix any message you send by hand with `[UJI]` in the title.** Testing a
+  briefing, a report, a restored copy — all of it goes out as `[UJI]`, so the
+  phone notification alone settles the question without opening the chat.
+- **Resetting state between test runs re-sends real history.** Clearing
+  `sent`/`briefed_bar` makes already-finished trades look new, so a TP notice from
+days ago goes out again looking live. When he reports a burst of repeated
+  messages, answer with the split — what the *scheduled* task sent (grep
+  `logs/run_*.log` for `SENT`/`briefing`) versus what you sent manually — and say
+  plainly which numbers are true-but-stale. "Data benar, waktunya salah" is the
+  honest phrasing; do not claim the numbers were wrong, and do not imply a signal
+  is pending when none is.
+
+### Confirm the clock before trusting any hour you print
+
+Server stamp + N hours is a two-step conversion and it is easy to apply the
+GMT+2→GMT+7 delta twice. Before telling the user *when* anything happens:
+
+- Read the raw feed: the unique label hours and the gaps between consecutive
+  bars. H4 here means gaps of exactly 4h and six labels per day
+  (01/05/09/13/17/21 server), which spans the day with a 52h weekend gap.
+- A label is BAR-OPEN in the server zone, so a bar labelled `S` closes at
+  `S + 4h` server = `S + 9h` in WIB (UTC+7 minus UTC+2). Verify against a known
+  event rather than re-deriving it.
+- If a derived table comes out internally impossible (every row the same, hours
+  that do not match the level of the data), the script is wrong — say so and
+  recompute from the raw rows. Never present a broken table as evidence, and
+  never answer "aman, tidak ada celah" before the arithmetic is checked: this
+  user tests the claim with a concrete hour, and being wrong twice in one reply
+  costs more trust than the original gap.
 
 ### `/report` — the month's signals MUST come from the backtest engine
 
