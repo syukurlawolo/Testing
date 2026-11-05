@@ -312,6 +312,23 @@ finished. Real incident: BUY 4065.25 / TP 4095.25 had been taken to TP (live bid
   the recap: `Masih jalan` drops the resolved one, and a separate
   `TP baru (live): 1 — belum dihitung, menunggu lilin tutup` keeps the count
   honest without pretending the backtest engine already knows it.
+- **`/plan` needs the same overlay, and it is the one he checks most.** Fixing
+  `/status` and `/report` left `/plan` still printing *"BUY LIMIT 4104.26 · tidak
+  perlu pasang order"* one section above an order that had already TP'd. Resolve
+  the position first, then let the verdict pick the whole message shape: `tp`/`sl`
+  → "tidak ada yang perlu dipasang sekarang" + scenarios marked *aktif setelah
+  lilin tutup berikutnya*; `filled`/`open` → "jangan buka posisi baru"; `pending`
+  → scenarios *tidak berlaku sampai limit selesai*. Never branch on
+  `ls['kind']` alone — a closed-bar `pending` and a live-resolved `tp` look
+  identical to `live_state()`.
+- **`resolve_live` must cover the losing path, not just the winning one.** A
+  pending limit whose price has already blown through its SL was filled on the
+  way — reporting `pending` there is the same lie as reporting `pending` after
+  TP. Also fill in `pl` for a position filled by the live price, or `/plan`
+  prints a position with no number beside it.
+- **"Jarak dari harga" should measure from the live price** (`live_px or
+  newest_close`), otherwise the distance to a level is wrong by the whole
+  intrabar move.
 - **The user catching this is a design signal, not a one-off.** When he reports
   "sudah TP tapi report masih running", check the live price against entry/TP/SL
   BEFORE defending the numbers — the EA status file usually settles it in one read.
