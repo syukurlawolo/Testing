@@ -282,6 +282,40 @@ GMT+2→GMT+7 delta twice. Before telling the user *when* anything happens:
   user tests the claim with a concrete hour, and being wrong twice in one reply
   costs more trust than the original gap.
 
+### Closing-price reports go blind between bars — overlay the LIVE price only for reporting
+
+`live_state()` walks CLOSED bars. The bar now forming is invisible to it, so
+between two closes the robot can report a position that reality has already
+finished. Real incident: BUY 4065.25 / TP 4095.25 had been taken to TP (live bid
+4130), yet `/status` said `ADA ORDER BUY BELUM TERISI` and `/report` said
+`RUNNING (limit menunggu)` — because the newest bar was still `o=h=l=c=4062.54`.
+
+`resolve_live(mod, df, ls, live_px)` is the fix, and its boundary matters:
+
+- **It reports; it never plans.** Overlay entry-fill / TP / SL against the live
+  price to choose the verdict (`tp` / `sl` / `filled` / `pending` / `flat`) and
+  then STOP. `plan_scenarios()` and `scan()` keep reading closes only, so the
+  backtest still describes exactly what ships. Say this out loud in the message:
+  *"ini dari harga yang bergerak sekarang, bukan close lilin"*.
+- **Never let it mint an entry signal.** A live price past a level looks like a
+  breakout, but the method confirms on CLOSE; signalling from it silently swaps
+  in an untested method and voids the 346-trade reference. When he asks for that,
+  answer with the trade-off and let the bar close (name the clock: server 05:00 =
+  12:02 WIB) instead of shipping it.
+- **`live_px` is only trustworthy while the newest bar is the current one.** Gate
+  on `read_ea_status()['fresh']` (≤5 min) — and during a history replay also on
+  `age_h <= 4.5`, or a two-day-old plan gets quoted against today's price.
+- **Every surface must agree, or the report looks broken anyway.** Fixing only
+  the planning row left the table above it still printing `RUNNING (limit
+  menunggu)` — he reads top to bottom and sees the contradiction. Update the
+  table label for the *resolved* order (`TP (baru — cek lilin tutup)`) and split
+  the recap: `Masih jalan` drops the resolved one, and a separate
+  `TP baru (live): 1 — belum dihitung, menunggu lilin tutup` keeps the count
+  honest without pretending the backtest engine already knows it.
+- **The user catching this is a design signal, not a one-off.** When he reports
+  "sudah TP tapi report masih running", check the live price against entry/TP/SL
+  BEFORE defending the numbers — the EA status file usually settles it in one read.
+
 ### `/report` — the month's signals MUST come from the backtest engine
 
 The user's required format, and the guarantee that makes it trusted:
