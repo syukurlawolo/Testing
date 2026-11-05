@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.9.8
+version: 1.9.9
 author: Hermes Agent
 license: MIT
 ---
@@ -329,6 +329,17 @@ finished. Real incident: BUY 4065.25 / TP 4095.25 had been taken to TP (live bid
 - **"Jarak dari harga" should measure from the live price** (`live_px or
   newest_close`), otherwise the distance to a level is wrong by the whole
   intrabar move.
+- **Every message that says "tunggu lilin tutup" must name the clock in WIB.**
+  He monitors by wall clock, but the feed stamps bars in SERVER time (GMT+2) —
+  a bar stamped `01:00` closes at `10:00 WIB`, not 01:00. Compute it, never
+  eyeball it: `_bar_open_wib(ts)` = epoch − `SERVER_UTC_OFFSET_H` + 7h,
+  `_bar_close_wib` = +4h, `_next_close_wib` = +8h. The six closes are
+  02/06/10/14/18/22 WIB — cross-check any new output against that list.
+- **One `_cekwib(newest_ts)` helper, used by all three reports.** It must accept
+  BOTH epoch ints (raw feed) and pandas `Timestamp` (what `/status` carries):
+  `int(Timestamp)` raises `TypeError`, and the failure only shows up in the one
+  command that passes a Timestamp. Add `%d-%b` to the format when the close
+  lands on another date, or `23:00` reads as if it were tonight.
 - **The user catching this is a design signal, not a one-off.** When he reports
   "sudah TP tapi report masih running", check the live price against entry/TP/SL
   BEFORE defending the numbers — the EA status file usually settles it in one read.
