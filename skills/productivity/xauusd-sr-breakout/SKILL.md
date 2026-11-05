@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.9.9
+version: 1.9.10
 author: Hermes Agent
 license: MIT
 ---
@@ -297,11 +297,12 @@ finished. Real incident: BUY 4065.25 / TP 4095.25 had been taken to TP (live bid
   then STOP. `plan_scenarios()` and `scan()` keep reading closes only, so the
   backtest still describes exactly what ships. Say this out loud in the message:
   *"ini dari harga yang bergerak sekarang, bukan close lilin"*.
-- **Never let it mint an entry signal.** A live price past a level looks like a
-  breakout, but the method confirms on CLOSE; signalling from it silently swaps
-  in an untested method and voids the 346-trade reference. When he asks for that,
-  answer with the trade-off and let the bar close (name the clock: server 05:00 =
-  12:02 WIB) instead of shipping it.
+- **Never print a scenario built on a level the price has already jumped past.** `plan_scenarios()` compares against the newest close, but the method reacts only to levels crossed *on that bar* (`prev_close <= level < close`). After a big bar the previous level stays "below close" in the scan while being long gone in reality, so a BUY-at-that-level line reads as a live plan that can never fire. Before rendering, drop any scenario whose level was already exceeded by an earlier bar — and when he asks "why no signal at that entry?", the answer is this rule, not a bug.
+ - **Never let it mint an entry signal.** A live price past a level looks like a
+   breakout, but the method confirms on CLOSE; signalling from it silently swaps
+   in an untested method and voids the 346-trade reference. When he asks for that,
+   answer with the trade-off and let the bar close (name the clock: server 05:00 =
+   12:02 WIB) instead of shipping it.
 - **`live_px` is only trustworthy while the newest bar is the current one.** Gate
   on `read_ea_status()['fresh']` (≤5 min) — and during a history replay also on
   `age_h <= 4.5`, or a two-day-old plan gets quoted against today's price.
@@ -329,20 +330,61 @@ finished. Real incident: BUY 4065.25 / TP 4095.25 had been taken to TP (live bid
 - **"Jarak dari harga" should measure from the live price** (`live_px or
   newest_close`), otherwise the distance to a level is wrong by the whole
   intrabar move.
-- **Every message that says "tunggu lilin tutup" must name the clock in WIB.**
-  He monitors by wall clock, but the feed stamps bars in SERVER time (GMT+2) —
-  a bar stamped `01:00` closes at `10:00 WIB`, not 01:00. Compute it, never
-  eyeball it: `_bar_open_wib(ts)` = epoch − `SERVER_UTC_OFFSET_H` + 7h,
-  `_bar_close_wib` = +4h, `_next_close_wib` = +8h. The six closes are
+- **Every message that says "tunggu lilin tutup" must name the clock in WIB — and the
+  conversion has exactly ONE correct form on this feed.** He monitors by wall clock, but
+  bars are stamped in server time (GMT+2) while Jakarta is GMT+7. `read_feed()` stores the
+  server wall clock as if it were UTC (`strptime(...).replace(tzinfo=utc).timestamp()`), so
+  the epoch must be read back as plain server time and shifted **+5 hours**. Both
+  plausible-looking alternatives are wrong and were shipped here in sequence — subtracting
+  `SERVER_UTC_OFFSET_H` shifts everything 2h early, converting the epoch to local shifts it
+  5h early; either way a bar that closed hours ago is reported as "still forming".
+  `_bar_open_wib(ts)`, `_bar_close_wib` = +4h, `_next_close_wib` = +8h. The six closes are
   02/06/10/14/18/22 WIB — cross-check any new output against that list.
+- **Assert the conversion against two known bars whenever it is touched.** Ground truth is
+  the user's own MT4: stamp `01:00` server = the 06:00–10:00 WIB bar (opens 06:00, closes
+  10:00); stamp `05:00` = the 10:00–14:00 WIB bar. A version that rejects those two rows is
+  wrong no matter how plausible its arithmetic.
+- **Never rewrite a time helper on the strength of a `1970-01-01` probe alone.** That output
+  only ever meant the probe passed an epoch where a datetime was expected — the function may
+  have been correct. Read what its caller actually stores (`read_feed` ints vs pandas
+  `Timestamp`) before editing, or the repair breaks a working clock. One helper must accept
+  BOTH; `int(Timestamp)` raises, and the failure surfaces only in the command that passes a
+  Timestamp.
 - **One `_cekwib(newest_ts)` helper, used by all three reports.** It must accept
   BOTH epoch ints (raw feed) and pandas `Timestamp` (what `/status` carries):
   `int(Timestamp)` raises `TypeError`, and the failure only shows up in the one
   command that passes a Timestamp. Add `%d-%b` to the format when the close
   lands on another date, or `23:00` reads as if it were tonight.
-- **The user catching this is a design signal, not a one-off.** When he reports
-  "sudah TP tapi report masih running", check the live price against entry/TP/SL
-  BEFORE defending the numbers — the EA status file usually settles it in one read.
+- **Verification sequences that separate "task fired" from "task lied"** live in `references/live-deployment.md`, alongside the feed/scheduler traps. `references/rule-questions-and-simulations.md` holds the level-grid tables for "plan berubah kalau tembus level berikutnya?" questions. `references/report-tracker-parity.md` holds the `track_orders()` vs `mod.run()` parity test and the list of "obvious" fixes that changed the method and were reverted.
+- **`track_orders()` must fill on the bar that TOUCHES the entry — the report-tracker bug that outlived every other fix.** Moving a pending order's fill test (`hi >= entry` / `lo <= entry`) BELOW the open-position exit test delays the fill by one bar, so the bar that actually gapped through the entry is never checked for TP/SL and the position exits a bar late or looks `terisi` forever. Across a whole history that also shifts `bar`/`exit_i` by one, so `/report` rows stop matching the frozen engine. copy its order of operations, do not re-derive it).
+ - **A report-side engine that forks from the locked one is the defect — prove identity, do not eyeball it.** Re-walking the bars in the wrapper is allowed (the locked file must stay read-only), but after ANY change to that walk, run `mod.run(df)` and `track_orders(mod, df)` on the same frame and assert identical trade count and identical entries/exits/labels. A reporting bug that leaves the backtest intact still tells him the wrong thing about money, and he reads "masih running" after a TP as a lost trade.
+ - **Two sources of truth produce contradictory messages in the same cycle.** When `resolve_live` (live overlay) and `track_orders` (bar replay) disagree, the briefing and the `/status` say opposite things about the SAME position. Before blaming the feed or the method, print both verdicts side by side for the newest bar; the disagreement is the finding. Fix the tracker, never the overlay, because the method agrees with the overlay here.
+ - **Stamp every outgoing message with the real clock + live price.** A message
+   with no timestamp is unverifiable — when a clock is wrong the user has no way
+   to see it. Put `_live_stamp()` at the top of `send_all()` so it covers
+   `/status`, `/report`, `/plan`, `/posisi` AND the automatic briefings in one
+   place.
+ - **The feed epoch is SERVER wall clock stored as UTC, so WIB = stamp + 5h.**
+   `read_feed` does `strptime(...).replace(tzinfo=utc).timestamp()`, so reading it
+   back must NOT convert (`utcfromtimestamp` then add `7 - SERVER_UTC_OFFSET_H`).
+   Two earlier versions were wrong in opposite directions — subtracting the
+   offset (4h early) and double-converting (5h late). Only the two rows below
+   prove it: STAMP `01:00 server` = bar 06:00–10:00 WIB, STAMP `05:00 server` =
+   bar 10:00–14:00 WIB. Assert on those before trusting any clock output.
+ - **Never "optimise" `track_orders` to close a position on its filling bar.**
+   The locked method tests exits (step 1) BEFORE fills (step 2), so a limit filled
+   on bar X can only close on bar X+1. Testing the exit on the fill bar turned
+   348 trades into 410 — 62 trades the method never takes. After any edit to
+   `track_orders`, assert its finished-trade count equals `mod.run()`: 348 trades,
+   204 TP, 144 SL. A mismatch means the method changed, not the report.
+ - **"Masih berjalan" is often CORRECT, not a bug.** Because exits are tested a
+   bar late, a position filled on the newest closed bar has had no chance to be
+   closed yet — even a price blow-through is not recorded until the next bar
+   closes. Check `mod.run()` output before calling it a defect; if the method has
+   not closed the trade, the report must not pretend it has.
+ - **The user catching this is a design signal, not a one-off.** When he reports
+   "sudah TP tapi report masih running", check the live price against entry/TP/SL
+   BEFORE defending the numbers — the EA status file usually settles it in one read.
 
 ### `/report` — the month's signals MUST come from the backtest engine
 
