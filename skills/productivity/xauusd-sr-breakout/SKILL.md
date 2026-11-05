@@ -1,7 +1,7 @@
 ---
 name: xauusd-sr-breakout
 description: Use for XAUUSD S/R breakout backtests, live signals, git backup and restore.
-version: 1.9.7
+version: 1.9.8
 author: Hermes Agent
 license: MIT
 ---
